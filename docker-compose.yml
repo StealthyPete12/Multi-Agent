@@ -1,0 +1,66 @@
+name: ${COMPOSE_PROJECT_NAME:-swarm}
+
+services:
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: ${COMPOSE_PROJECT_NAME:-swarm}_rabbitmq
+    ports:
+      - "${RABBITMQ_PORT:-5672}:5672"
+      - "${RABBITMQ_MANAGEMENT_PORT:-15672}:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-swarm}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-swarm_dev_password}
+      RABBITMQ_DEFAULT_VHOST: ${RABBITMQ_VHOST:-/}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16
+    container_name: ${COMPOSE_PROJECT_NAME:-swarm}_postgres
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-swarm}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-swarm_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-code_review_swarm}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-swarm} -d ${POSTGRES_DB:-code_review_swarm}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: ${COMPOSE_PROJECT_NAME:-swarm}_redis
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:-swarm_dev_password}"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a ${REDIS_PASSWORD:-swarm_dev_password} ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  rabbitmq_data:
+    name: ${COMPOSE_PROJECT_NAME:-swarm}_rabbitmq_data
+  postgres_data:
+    name: ${COMPOSE_PROJECT_NAME:-swarm}_postgres_data
+  redis_data:
+    name: ${COMPOSE_PROJECT_NAME:-swarm}_redis_data
