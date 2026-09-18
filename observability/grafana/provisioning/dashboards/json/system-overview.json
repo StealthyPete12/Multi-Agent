@@ -1,0 +1,90 @@
+{
+  "title": "Swarm: System Overview",
+  "uid": "swarm-system-overview",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "10s",
+  "time": { "from": "now-1h", "to": "now" },
+  "tags": ["swarm", "system"],
+  "panels": [
+    {
+      "id": 1,
+      "title": "Event throughput (by event_type)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (event_type, direction) (rate(swarm_events_processed_total[1m]))",
+          "legendFormat": "{{event_type}} ({{direction}})",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "RabbitMQ queue depth (ready messages)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "rabbitmq_queue_messages_ready{queue=~\"q\\\\..*\"}",
+          "legendFormat": "{{queue}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Retry rate (by rung)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (rung) (rate(swarm_retry_total[5m]))",
+          "legendFormat": "{{rung}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "DLQ rate (poison vs exhausted-retry)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (poison) (rate(swarm_dlq_total[5m]))",
+          "legendFormat": "poison={{poison}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "RabbitMQ publish/consume rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum(rate(rabbitmq_channel_messages_published_total[1m]))", "legendFormat": "published", "refId": "A" },
+        { "expr": "sum(rate(rabbitmq_channel_messages_delivered_total[1m]))", "legendFormat": "delivered", "refId": "B" }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Circuit breaker opens / rate-limit delays",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum(rate(swarm_circuit_breaker_opens_total[5m]))", "legendFormat": "breaker opens", "refId": "A" },
+        { "expr": "sum(rate(swarm_rate_limit_delays_total[5m]))", "legendFormat": "rate-limit delays", "refId": "B" }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,77 @@
+{
+  "title": "Swarm: LLM",
+  "uid": "swarm-llm",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "10s",
+  "time": { "from": "now-1h", "to": "now" },
+  "tags": ["swarm", "llm"],
+  "panels": [
+    {
+      "id": 1,
+      "title": "LLM requests (by provider/model)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum by (provider, model, outcome) (rate(swarm_llm_calls_total[5m]))", "legendFormat": "{{provider}}/{{model}} {{outcome}}", "refId": "A" }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "LLM failures (by reason)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum by (provider, reason) (rate(swarm_llm_failures_total[5m]))", "legendFormat": "{{provider}} {{reason}}", "refId": "A" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "LLM latency (p50/p95/p99)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum by (le) (rate(swarm_llm_duration_milliseconds_bucket[5m])))", "legendFormat": "p50", "refId": "A" },
+        { "expr": "histogram_quantile(0.95, sum by (le) (rate(swarm_llm_duration_milliseconds_bucket[5m])))", "legendFormat": "p95", "refId": "B" },
+        { "expr": "histogram_quantile(0.99, sum by (le) (rate(swarm_llm_duration_milliseconds_bucket[5m])))", "legendFormat": "p99", "refId": "C" }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Estimated LLM spend (USD / hour)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" }, "overrides": [] },
+      "targets": [
+        { "expr": "sum by (provider, model) (rate(swarm_llm_cost_usd_total[5m]) * 3600)", "legendFormat": "{{provider}}/{{model}}", "refId": "A" }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Tokens in/out (5m rate)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum(rate(swarm_llm_tokens_in_total[5m]))", "legendFormat": "tokens in", "refId": "A" },
+        { "expr": "sum(rate(swarm_llm_tokens_out_total[5m]))", "legendFormat": "tokens out", "refId": "B" }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Circuit breaker opens (LLM providers)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum by (breaker) (rate(swarm_circuit_breaker_opens_total[5m]))", "legendFormat": "{{breaker}}", "refId": "A" }
+      ]
+    }
+  ]
+}

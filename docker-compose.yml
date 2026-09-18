@@ -7,12 +7,17 @@ services:
     ports:
       - "${RABBITMQ_PORT:-5672}:5672"
       - "${RABBITMQ_MANAGEMENT_PORT:-15672}:15672"
+      # rabbitmq_prometheus plugin (enabled via the mounted enabled_plugins
+      # file below) — scraped by the prometheus service for queue
+      # depth/publish/consume-rate/DLQ-size observability.
+      - "${RABBITMQ_PROMETHEUS_PORT:-15692}:15692"
     environment:
       RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-swarm}
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-swarm_dev_password}
       RABBITMQ_DEFAULT_VHOST: ${RABBITMQ_VHOST:-/}
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
+      - ./observability/rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
       interval: 10s
@@ -57,6 +62,106 @@ services:
       start_period: 10s
     restart: unless-stopped
 
+  # network_mode: host on these four (Linux only — see README's
+  # observability section): watcher/researcher/reviewer are host
+  # processes, not containers (docker-compose only owns the broker/DB/
+  # cache), and every existing cross-service call in this repo already
+  # goes through a published host port (localhost:5432, :5672, ...)
+  # rather than the compose bridge network's container DNS. Prometheus
+  # scraping the agents, Grafana querying Prometheus, and the postgres
+  # exporter querying Postgres all follow that same, already-proven
+  # localhost:PORT path instead of introducing new container-to-container
+  # bridge traffic.
+  postgres_exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.15.0
+    container_name: ${COMPOSE_PROJECT_NAME:-swarm}_postgres_exporter
+    network_mode: host
+    environment:
+      DATA_SOURCE_NAME: "postgresql://${POSTGRES_USER:-swarm}:${POSTGRES_PASSWORD:-swarm_dev_password}@localhost:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-code_review_swarm}?sslmode=disable"
+      PG_EXPORTER_WEB_LISTEN_ADDRESS: ":${POSTGRES_EXPORTER_PORT:-9187}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:${POSTGRES_EXPORTER_PORT:-9187}/metrics >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # Arize Phoenix — receives OTLP traces/spans from every agent
+  # (shared/telemetry.py), with first-class LLM-call visualization
+  # (prompt/response, token usage) for the shared/llm.py spans.
+  phoenix:
+    image: arizephoenix/phoenix:latest
+    container_name: ${COMPOSE_PROJECT_NAME:-swarm}_phoenix
+    network_mode: host
+    environment:
+      PHOENIX_WORKING_DIR: /mnt/data
+      PHOENIX_PORT: "${PHOENIX_UI_PORT:-6006}"
+      PHOENIX_GRPC_PORT: "${PHOENIX_GRPC_PORT:-4317}"
+    volumes:
+      - phoenix_data:/mnt/data
+    healthcheck:
+      # No shell/coreutils in this image (distroless-style) — CMD-SHELL
+      # can't run at all here, so the check is a plain Python one-liner
+      # via the exec form instead of wget.
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:${PHOENIX_UI_PORT:-6006}/', timeout=3)",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: ${COMPOSE_PROJECT_NAME:-swarm}_prometheus
+    network_mode: host
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.listen-address=:${PROMETHEUS_PORT:-9090}"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:${PROMETHEUS_PORT:-9090}/-/healthy || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: ${COMPOSE_PROJECT_NAME:-swarm}_grafana
+    network_mode: host
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_HTTP_PORT: "${GRAFANA_PORT:-3000}"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:${GRAFANA_PORT:-3000}/api/health >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
 volumes:
   rabbitmq_data:
     name: ${COMPOSE_PROJECT_NAME:-swarm}_rabbitmq_data
@@ -64,3 +169,9 @@ volumes:
     name: ${COMPOSE_PROJECT_NAME:-swarm}_postgres_data
   redis_data:
     name: ${COMPOSE_PROJECT_NAME:-swarm}_redis_data
+  phoenix_data:
+    name: ${COMPOSE_PROJECT_NAME:-swarm}_phoenix_data
+  prometheus_data:
+    name: ${COMPOSE_PROJECT_NAME:-swarm}_prometheus_data
+  grafana_data:
+    name: ${COMPOSE_PROJECT_NAME:-swarm}_grafana_data

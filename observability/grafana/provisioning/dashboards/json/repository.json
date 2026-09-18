@@ -1,0 +1,84 @@
+{
+  "title": "Swarm: Repository",
+  "uid": "swarm-repository",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "10s",
+  "time": { "from": "now-1h", "to": "now" },
+  "tags": ["swarm", "repository"],
+  "panels": [
+    {
+      "id": 1,
+      "title": "Clone duration (p50/p95/p99)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum by (le) (rate(swarm_repository_clone_duration_milliseconds_bucket[5m])))", "legendFormat": "p50", "refId": "A" },
+        { "expr": "histogram_quantile(0.95, sum by (le) (rate(swarm_repository_clone_duration_milliseconds_bucket[5m])))", "legendFormat": "p95", "refId": "B" },
+        { "expr": "histogram_quantile(0.99, sum by (le) (rate(swarm_repository_clone_duration_milliseconds_bucket[5m])))", "legendFormat": "p99", "refId": "C" }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Cache hit rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "max": 1, "min": 0 }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "sum(rate(swarm_repository_cache_hits_total[10m])) / (sum(rate(swarm_repository_cache_hits_total[10m])) + sum(rate(swarm_repository_clones_total[10m])))",
+          "legendFormat": "cache hit rate",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Blast-radius query duration (p50/p95/p99)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum by (le) (rate(swarm_blast_radius_duration_milliseconds_bucket[5m])))", "legendFormat": "p50", "refId": "A" },
+        { "expr": "histogram_quantile(0.95, sum by (le) (rate(swarm_blast_radius_duration_milliseconds_bucket[5m])))", "legendFormat": "p95", "refId": "B" },
+        { "expr": "histogram_quantile(0.99, sum by (le) (rate(swarm_blast_radius_duration_milliseconds_bucket[5m])))", "legendFormat": "p99", "refId": "C" }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Postgres write duration (p95, by table)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum by (le, table) (rate(swarm_db_write_duration_milliseconds_bucket[5m])))", "legendFormat": "{{table}}", "refId": "A" }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Postgres connection pool (researcher/reviewer)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "swarm_db_pool_connections", "legendFormat": "{{component}} {{state}}", "refId": "A" }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Postgres failures",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "sum by (operation) (rate(swarm_db_failures_total[5m]))", "legendFormat": "{{operation}}", "refId": "A" }
+      ]
+    }
+  ]
+}

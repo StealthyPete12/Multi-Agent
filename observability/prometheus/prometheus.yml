@@ -1,0 +1,48 @@
+# Prometheus scrape configuration for the code-review-swarm stack.
+#
+# Every target below is reached via `localhost:<port>` because Prometheus
+# itself runs with `network_mode: host` (see docker-compose.yml) — this
+# sandbox's Docker daemon blocks fresh container-to-container bridge
+# traffic (confirmed: even ICMP between two freshly created containers on
+# the compose network times out), while host<->container via a published
+# port works reliably, exactly like every existing agent already talks to
+# Postgres/RabbitMQ/Redis. Host networking sidesteps the broken path
+# entirely instead of fighting it. See PHASE_5_REPORT.md's "Known
+# limitations" for the full diagnosis.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: watcher
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["localhost:8001"]
+        labels: { service: watcher }
+
+  - job_name: researcher
+    static_configs:
+      - targets: ["localhost:9102"]
+        labels: { service: researcher }
+
+  - job_name: reviewer
+    static_configs:
+      - targets: ["localhost:9103"]
+        labels: { service: reviewer }
+
+  - job_name: rabbitmq
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["localhost:15692"]
+        labels: { service: rabbitmq }
+
+  - job_name: postgres
+    static_configs:
+      - targets: ["localhost:9187"]
+        labels: { service: postgres }
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+        labels: { service: prometheus }
