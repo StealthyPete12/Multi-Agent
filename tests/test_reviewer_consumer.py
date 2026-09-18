@@ -124,6 +124,7 @@ class FakeIdempotency:
     def __init__(self, *, already_claimed: bool = False) -> None:
         self.claimed: list[str] = []
         self.released: list[str] = []
+        self.completed: list[str] = []
         self._already_claimed = already_claimed
 
     async def claim(self, *, event_id, event_type, trace_id):
@@ -132,6 +133,9 @@ class FakeIdempotency:
 
     async def release(self, event_id):
         self.released.append(event_id)
+
+    async def mark_complete(self, event_id):
+        self.completed.append(event_id)
 
 
 def _findings(**overrides) -> FindingsReady:
@@ -262,6 +266,7 @@ async def test_handle_message_valid_publishes_review_completed():
     assert review_envelope.payload.commit_sha == envelope.payload.commit_sha
     assert message.acked is True
     assert idempotency.claimed == [envelope.event_id]
+    assert idempotency.completed == [envelope.event_id]
 
 
 async def test_handle_message_already_processed_does_not_publish():

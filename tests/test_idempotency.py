@@ -1,9 +1,9 @@
+import asyncio
 import uuid
 
 import asyncpg
 import pytest
 
-from shared.errors import RetryableError
 from shared.idempotency import IdempotencyStore
 
 DATABASE_URL = "postgresql://swarm:swarm_dev_password@localhost:5432/code_review_swarm"
@@ -28,10 +28,11 @@ async def test_claim_succeeds_first_time(pool, event_id):
     claimed = await store.claim(event_id=event_id, event_type="test.event", trace_id=None)
     assert claimed is True
     assert await store.is_claimed(event_id) is True
+    assert await store.is_completed(event_id) is False
     await store.release(event_id)
 
 
-async def test_claim_fails_on_second_attempt(pool, event_id):
+async def test_claim_fails_on_second_attempt_while_active(pool, event_id):
     store = IdempotencyStore(pool)
     first = await store.claim(event_id=event_id, event_type="test.event", trace_id=None)
     second = await store.claim(event_id=event_id, event_type="test.event", trace_id=None)
@@ -40,7 +41,7 @@ async def test_claim_fails_on_second_attempt(pool, event_id):
     await store.release(event_id)
 
 
-async def test_release_allows_reclaim(pool, event_id):
+async def test_release_allows_immediate_reclaim(pool, event_id):
     store = IdempotencyStore(pool)
     await store.claim(event_id=event_id, event_type="test.event", trace_id=None)
     await store.release(event_id)
@@ -49,40 +50,41 @@ async def test_release_allows_reclaim(pool, event_id):
     await store.release(event_id)
 
 
-async def test_claim_and_process_skips_duplicate(pool, event_id):
+async def test_mark_complete_then_claim_is_permanently_blocked(pool, event_id):
     store = IdempotencyStore(pool)
-    calls = []
+    await store.claim(event_id=event_id, event_type="test.event", trace_id=None)
+    await store.mark_complete(event_id)
+    assert await store.is_completed(event_id) is True
 
-    async def work():
-        calls.append(1)
-        return "done"
-
-    first = await store.claim_and_process(
-        event_id=event_id, event_type="test.event", trace_id=None, work=work
-    )
-    second = await store.claim_and_process(
-        event_id=event_id, event_type="test.event", trace_id=None, work=work
-    )
-    assert first == "done"
-    from shared.idempotency import _DUPLICATE
-
-    assert second is _DUPLICATE
-    assert len(calls) == 1
-    await store.release(event_id)
+    # Even after the (long) stale window, a *completed* claim must never
+    # be reclaimed — that would mean redoing already-finished, possibly
+    # side-effecting work (duplicate Slack message, duplicate report).
+    store_impatient = IdempotencyStore(pool, stale_after_seconds=0)
+    reclaimed = await store_impatient.claim(event_id=event_id, event_type="test.event", trace_id=None)
+    assert reclaimed is False
 
 
-async def test_claim_and_process_releases_on_retryable_failure(pool, event_id):
-    store = IdempotencyStore(pool)
+async def test_abandoned_claim_is_reclaimed_after_staleness_window(pool, event_id):
+    """Simulates a hard process crash: claim() succeeds, but the process
+    dies before mark_complete()/release() ever runs (no exception handler
+    gets a chance to fire on a SIGKILL). A later attempt — e.g. after
+    RabbitMQ redelivers the still-unacked message to a restarted consumer
+    — must be able to reclaim it once the claim looks abandoned, or the
+    message would be silently dropped from the pipeline's output forever
+    even though the broker never lost it."""
+    crashed_worker = IdempotencyStore(pool, stale_after_seconds=0.2)
+    claimed = await crashed_worker.claim(event_id=event_id, event_type="test.event", trace_id=None)
+    assert claimed is True
+    # ... process is SIGKILLed here: no release(), no mark_complete() ...
 
-    async def failing_work():
-        raise RetryableError("transient")
+    # Immediately after, a fresh attempt correctly sees it as still active.
+    too_soon = await crashed_worker.claim(event_id=event_id, event_type="test.event", trace_id=None)
+    assert too_soon is False
 
-    with pytest.raises(RetryableError):
-        await store.claim_and_process(
-            event_id=event_id, event_type="test.event", trace_id=None, work=failing_work
-        )
+    await asyncio.sleep(0.3)  # past the 0.2s staleness window
 
-    # Claim was released, so a later attempt (e.g. a retry-ladder
-    # redelivery) can reclaim and try again rather than being
-    # permanently skipped as "already processed".
-    assert await store.is_claimed(event_id) is False
+    restarted_worker = IdempotencyStore(pool, stale_after_seconds=0.2)
+    reclaimed = await restarted_worker.claim(event_id=event_id, event_type="test.event", trace_id=None)
+    assert reclaimed is True
+    await restarted_worker.mark_complete(event_id)
+    assert await restarted_worker.is_completed(event_id) is True

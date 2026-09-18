@@ -258,6 +258,7 @@ async def handle_message(
                     "sensitive_hits": len(findings_payload.sensitive_hits),
                 },
             )
+            await idempotency.mark_complete(envelope.event_id)
             await message.ack()
         except Exception as exc:
             category = classify_researcher_failure(exc)

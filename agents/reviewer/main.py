@@ -261,6 +261,7 @@ async def handle_message(
                 # storage.is_processed() found it already fully persisted
                 # (e.g. the outer claim above raced with a prior in-flight
                 # completion) — nothing left to do.
+                await idempotency.mark_complete(envelope.event_id)
                 await message.ack()
                 return
 
@@ -282,6 +283,7 @@ async def handle_message(
                     "report_id": review.report_id,
                 },
             )
+            await idempotency.mark_complete(envelope.event_id)
             await message.ack()
         except Exception as exc:
             category = classify_reviewer_failure(exc)

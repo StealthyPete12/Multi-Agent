@@ -96,6 +96,7 @@ class FakeIdempotency:
     def __init__(self, *, already_claimed: bool = False) -> None:
         self.claimed: list[str] = []
         self.released: list[str] = []
+        self.completed: list[str] = []
         self._already_claimed = already_claimed
 
     async def claim(self, *, event_id, event_type, trace_id):
@@ -104,6 +105,9 @@ class FakeIdempotency:
 
     async def release(self, event_id):
         self.released.append(event_id)
+
+    async def mark_complete(self, event_id):
+        self.completed.append(event_id)
 
 
 def _write_sample_repo(root: Path) -> None:
@@ -197,6 +201,7 @@ async def test_handle_message_valid_commit_publishes_findings_ready(tmp_path):
     assert findings_envelope.payload.repo == "acme/widgets"
     assert message.acked is True
     assert idempotency.claimed == [envelope.event_id]
+    assert idempotency.completed == [envelope.event_id]
     assert idempotency.released == []
 
 
