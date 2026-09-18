@@ -29,10 +29,12 @@ from datetime import datetime, timezone
 from pydantic import ValidationError
 
 from agents.researcher.db import Database
+from agents.researcher.diff import get_truncated_diff
 from agents.researcher.graph import build_dependency_graph
 from agents.researcher.impact import DEFAULT_MAX_DEPTH, changed_files_to_modules
 from agents.researcher.repository import RepositoryCache
 from agents.researcher.sensitive import detect_sensitive_hits
+from agents.researcher.summarize import generate_semantic_summary
 from shared.broker import Broker
 from shared.contracts import (
     BlastRadius,
@@ -42,6 +44,7 @@ from shared.contracts import (
     FindingsReady,
     make_envelope,
 )
+from shared.llm import LLMClient, get_llm_client
 from shared.logging import configure_logging, trace_context
 
 QUEUE_COMMITS = os.environ.get("QUEUE_COMMITS", "q.commits")
@@ -56,6 +59,7 @@ async def analyze_commit(
     *,
     repo_cache: RepositoryCache,
     database: Database,
+    llm_client: LLMClient | None = None,
 ) -> FindingsReady:
     """Run the full clone -> AST -> graph -> store -> blast-radius pipeline
     for one commit and build the `findings.ready` payload."""
@@ -93,6 +97,25 @@ async def analyze_commit(
 
     sensitive_hits = detect_sensitive_hits(payload.changed_files)
 
+    t0 = time.monotonic()
+    diff_excerpt = await get_truncated_diff(repo_path, payload.commit_sha, payload.changed_files)
+    active_llm_client = llm_client if llm_client is not None else get_llm_client(purpose="summary")
+    semantic_summary = await generate_semantic_summary(
+        active_llm_client,
+        commit_message=payload.message,
+        changed_files=payload.changed_files,
+        diff_excerpt=diff_excerpt,
+    )
+    log.info(
+        "semantic summary generated",
+        extra={
+            "repo": payload.repo,
+            "commit_sha": payload.commit_sha,
+            "summary_length": len(semantic_summary),
+            "duration_ms": (time.monotonic() - t0) * 1000,
+        },
+    )
+
     completed_at = datetime.now(timezone.utc)
     return FindingsReady(
         commit_sha=payload.commit_sha,
@@ -108,7 +131,7 @@ async def analyze_commit(
             max_depth=radius.max_depth_reached,
         ),
         sensitive_hits=sensitive_hits,
-        semantic_summary="",
+        semantic_summary=semantic_summary,
     )
 
 
@@ -118,6 +141,7 @@ async def handle_message(
     broker: Broker,
     repo_cache: RepositoryCache,
     database: Database,
+    llm_client: LLMClient | None = None,
 ) -> None:
     """Validate, analyze, publish `findings.ready`, then ack/nack one
     `commit.detected` message.
@@ -148,7 +172,7 @@ async def handle_message(
             )
 
             findings_payload = await analyze_commit(
-                envelope.payload, repo_cache=repo_cache, database=database
+                envelope.payload, repo_cache=repo_cache, database=database, llm_client=llm_client
             )
             findings_envelope = make_envelope(
                 findings_payload,
@@ -182,8 +206,16 @@ async def run() -> None:
     repo_cache = RepositoryCache()
     database = Database()
     await database.connect()
+    llm_client = get_llm_client(purpose="summary")
 
-    log.info("researcher started", extra={"queue": QUEUE_COMMITS, "publishes_to": QUEUE_FINDINGS})
+    log.info(
+        "researcher started",
+        extra={
+            "queue": QUEUE_COMMITS,
+            "publishes_to": QUEUE_FINDINGS,
+            "llm_provider": llm_client.provider,
+        },
+    )
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -192,7 +224,13 @@ async def run() -> None:
 
     async with queue.iterator() as queue_iter:
         consume_task = asyncio.create_task(
-            _consume(queue_iter, broker=broker, repo_cache=repo_cache, database=database)
+            _consume(
+                queue_iter,
+                broker=broker,
+                repo_cache=repo_cache,
+                database=database,
+                llm_client=llm_client,
+            )
         )
         await stop_event.wait()
         consume_task.cancel()
@@ -203,10 +241,21 @@ async def run() -> None:
 
 
 async def _consume(
-    queue_iter, *, broker: Broker, repo_cache: RepositoryCache, database: Database
+    queue_iter,
+    *,
+    broker: Broker,
+    repo_cache: RepositoryCache,
+    database: Database,
+    llm_client: LLMClient | None = None,
 ) -> None:
     async for message in queue_iter:
-        await handle_message(message, broker=broker, repo_cache=repo_cache, database=database)
+        await handle_message(
+            message,
+            broker=broker,
+            repo_cache=repo_cache,
+            database=database,
+            llm_client=llm_client,
+        )
 
 
 def main() -> None:
