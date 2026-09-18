@@ -11,6 +11,12 @@ This repo implements:
   → RabbitMQ → consumer with durability and acknowledgements. No AI, no
   Postgres business logic, no blast-radius analysis yet. See
   [`PHASE_1_REPORT.md`](PHASE_1_REPORT.md).
+- **Phase 2: repository-analysis engine** — the researcher agent now
+  clones repositories, builds a Python import dependency graph via AST
+  analysis, persists it to Postgres, computes blast radius with a
+  recursive CTE, flags sensitive-path changes, and publishes
+  `findings.ready`. No AI, no Slack, no reviewer logic yet. See
+  [`PHASE_2_REPORT.md`](PHASE_2_REPORT.md).
 
 ## Architecture
 
@@ -24,12 +30,22 @@ agents/watcher  ──────────────► RabbitMQ (swarm.ev
                                              │  dead-letters to q.commits.dlq)
                                              ▼
                                 agents/researcher (consumer)
-                                validates contract, logs, acks
+                                clone repo -> AST import graph -> Postgres
+                                (modules/imports) -> blast radius (recursive
+                                CTE) -> sensitive-path check
+                                             │
+                                             │  findings.ready
+                                             ▼
+                                          q.findings (durable,
+                                          dead-letters to q.findings.dlq)
 ```
 
 `tools/seed_commit.py` can publish synthetic `commit.detected` events
 directly, bypassing the watcher/GitHub entirely — useful for local
-testing without a real repo or webhook.
+testing without a real repo or webhook. See
+[`agents/researcher/README.md`](agents/researcher/README.md) for the
+researcher's internal architecture (repository cache, dependency graph,
+blast radius).
 
 Every event is an `Envelope[Payload]` (see [`shared/contracts.py`](shared/contracts.py))
 carrying a `trace_id` that's generated once per webhook delivery (or
@@ -56,7 +72,12 @@ their READMEs for what they'll own in later phases.
 │   └── README.md
 ├── agents/
 │   ├── watcher/              # GitHub webhook -> commit.detected (FastAPI)
-│   ├── researcher/           # commit.detected consumer (Phase 1: verification only)
+│   ├── researcher/           # commit.detected -> repo clone, AST graph, blast radius -> findings.ready
+│   │   ├── repository.py     # local git clone/cache
+│   │   ├── graph.py          # AST import analysis -> DependencyGraph
+│   │   ├── impact.py         # in-memory blast-radius traversal
+│   │   ├── db.py             # Postgres upserts + recursive-CTE blast radius
+│   │   └── sensitive.py      # sensitive-path detection
 │   ├── reviewer/              # placeholder — future FindingsReady aggregation
 │   └── orchestrator/          # placeholder — future topology/retry ownership
 ├── tools/
@@ -181,6 +202,40 @@ log collectors.
    the same `trace_id`/`event_id` the seed script printed, then acks the
    message. Check http://localhost:15672 (RabbitMQ management UI) to see
    `q.commits` and its `q.commits.dlq` dead-letter queue.
+
+### Testing the researcher's repository analysis (Phase 2)
+
+`CommitDetected.repo` (e.g. `acme/widgets`) is resolved to a clone URL as
+`${REPO_CLONE_BASE_URL}/${repo}.git` by default. To test against a real
+GitHub repo, leave `REPO_CLONE_BASE_URL=https://github.com/` (the
+default) and seed a commit with a real `--repo`/`--sha`. To test entirely
+offline (no GitHub, no network), point it at a local git repository:
+
+```bash
+# 1. Create a local "remote" the researcher can clone from.
+mkdir -p /tmp/sample-remotes/acme/widgets.git
+cd /tmp/sample-remotes/acme/widgets.git
+git init -q -b main
+echo "def connect(): pass" > database.py
+mkdir auth && echo "import database" > auth/login.py && touch auth/__init__.py
+git add . && git commit -q -m "initial commit"
+git rev-parse HEAD   # <- use this as --sha below
+
+# 2. Point the researcher at it and run the pipeline as usual.
+export REPO_CLONE_BASE_URL="file:///tmp/sample-remotes/"
+python -m agents.researcher.main &
+python -m tools.seed_commit --repo acme/widgets --branch main --author jane \
+    --message "test change" --sha <sha-from-above> \
+    --changed-files database.py,auth/login.py
+```
+
+The researcher logs each stage (repository cache hit/miss, graph build,
+Postgres write, blast-radius query) and publishes `findings.ready` to
+`q.findings` with the computed blast radius and any sensitive-path hits
+(`auth/login.py` above matches the default `auth/` pattern). Running the
+same commit again logs a cache hit instead of re-cloning, and re-storing
+the same graph leaves `modules`/`imports` row counts unchanged
+(idempotent upserts).
 
 ## GitHub webhook setup (Path B)
 
