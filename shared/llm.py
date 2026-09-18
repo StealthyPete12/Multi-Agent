@@ -29,14 +29,19 @@ Usage::
 
 from __future__ import annotations
 
+import asyncio
 import os
+import random
 import time
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Awaitable, Callable, Protocol, TypeVar, runtime_checkable
 
 import httpx
 
+from shared.breaker import CircuitOpenError, get_circuit_breaker
+from shared.errors import PoisonMessageError, RetryableError, classify_exception
 from shared.logging import configure_logging
+from shared.ratelimit import get_rate_limiter
 
 __all__ = [
     "LLMClient",
@@ -54,6 +59,18 @@ __all__ = [
 log = configure_logging(service_name="llm")
 
 DEFAULT_TIMEOUT_SECONDS = float(os.environ.get("LLM_TIMEOUT_SECONDS", "30"))
+DEFAULT_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", "3"))
+DEFAULT_BACKOFF_BASE_SECONDS = float(os.environ.get("LLM_RETRY_BACKOFF_BASE_SECONDS", "1.0"))
+DEFAULT_BACKOFF_MAX_SECONDS = float(os.environ.get("LLM_RETRY_BACKOFF_MAX_SECONDS", "20.0"))
+DEFAULT_BREAKER_FAILURE_THRESHOLD = int(os.environ.get("LLM_BREAKER_FAILURE_THRESHOLD", "5"))
+DEFAULT_BREAKER_OPEN_SECONDS = float(os.environ.get("LLM_BREAKER_OPEN_SECONDS", "60"))
+RATE_LIMIT_ENABLED = os.environ.get("LLM_RATE_LIMIT_ENABLED", "true").strip().lower() not in (
+    "false",
+    "0",
+    "",
+)
+
+_T = TypeVar("_T")
 
 _DEFAULT_MODELS = {
     "anthropic": "claude-haiku-4-5-20251001",
@@ -118,11 +135,14 @@ def get_model_for(purpose: str, provider: str) -> str:
 
 
 class _BaseLLMClient:
-    """Shared timeout/retry-hook/logging plumbing for every real provider.
+    """Shared timeout/retry/rate-limit/circuit-breaker/logging plumbing
+    for every real provider.
 
-    Retry hooks are deliberately a no-op stub in Phase 3 — actual
-    backoff/retry looping is deferred to Phase 4 — but the constructor
-    surface exists now so Phase 4 doesn't need to touch call sites.
+    Every provider's ``complete()`` builds one inner zero-arg async
+    closure that performs the actual HTTP call and response parsing, then
+    hands it to :meth:`_execute_with_resilience`, which is the single
+    place backoff, jitter, error classification, rate limiting, and
+    circuit breaking live — no per-provider duplication.
     """
 
     provider: str = "base"
@@ -132,20 +152,116 @@ class _BaseLLMClient:
         *,
         model: str,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
-        max_retries: int = 0,
-        retry_backoff_seconds: float = 0.0,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        retry_backoff_seconds: float = DEFAULT_BACKOFF_BASE_SECONDS,
+        retry_backoff_max_seconds: float = DEFAULT_BACKOFF_MAX_SECONDS,
+        breaker_failure_threshold: int = DEFAULT_BREAKER_FAILURE_THRESHOLD,
+        breaker_open_seconds: float = DEFAULT_BREAKER_OPEN_SECONDS,
+        rate_limit_enabled: bool | None = None,
     ) -> None:
         self.model = model
         self.timeout_seconds = timeout_seconds
         self.max_retries = max_retries
         self.retry_backoff_seconds = retry_backoff_seconds
+        self.retry_backoff_max_seconds = retry_backoff_max_seconds
+        self.breaker_failure_threshold = breaker_failure_threshold
+        self.breaker_open_seconds = breaker_open_seconds
+        self.rate_limit_enabled = (
+            rate_limit_enabled if rate_limit_enabled is not None else RATE_LIMIT_ENABLED
+        )
 
-    async def _retrying(self, fn):
-        """Phase 4 hook point: currently calls ``fn`` once. A future phase
-        can loop up to ``self.max_retries`` times with
-        ``self.retry_backoff_seconds`` between attempts here, without
-        changing any caller."""
-        return await fn()
+    def _backoff_delay(self, attempt: int) -> float:
+        """Exponential backoff with full jitter: a random delay in
+        ``[0, min(base * 2**(attempt-1), max))``. Full jitter (rather than
+        a fixed or half-jittered delay) avoids synchronized retry storms
+        across multiple agent instances retrying the same provider outage
+        at once."""
+        ceiling = min(
+            self.retry_backoff_seconds * (2 ** (attempt - 1)), self.retry_backoff_max_seconds
+        )
+        return random.uniform(0, ceiling)
+
+    async def _acquire_rate_limit(self) -> None:
+        if not self.rate_limit_enabled:
+            return
+        key = f"{self.provider}:{self.model}"
+        try:
+            limiter = get_rate_limiter(self.provider, self.model)
+            await limiter.wait_and_acquire(key)
+        except TimeoutError:
+            raise
+        except Exception as exc:  # Redis unreachable, etc. — degrade gracefully.
+            log.warning(
+                "rate limiter unavailable, proceeding without limiting",
+                extra={"provider": self.provider, "model": self.model, "reason": str(exc)},
+            )
+
+    async def _execute_with_resilience(
+        self, operation: Callable[[], Awaitable[_T]]
+    ) -> _T:
+        """Run ``operation()`` (one full request+parse attempt) behind the
+        rate limiter and circuit breaker, retrying with backoff+jitter on
+        :class:`~shared.errors.RetryableError`-classified failures up to
+        ``self.max_retries`` times. Raises :class:`LLMError` on the final
+        failure (retryable-exhausted, poison, fatal, or an open circuit)
+        so every caller keeps catching exactly one exception type.
+        """
+        breaker = get_circuit_breaker(
+            self.provider,
+            failure_threshold=self.breaker_failure_threshold,
+            open_duration_seconds=self.breaker_open_seconds,
+        )
+
+        last_exc: Exception | None = None
+        for attempt in range(1, self.max_retries + 2):
+            try:
+                await self._acquire_rate_limit()
+            except TimeoutError as exc:
+                raise LLMError(f"{self.provider} rate limit wait exceeded: {exc}") from exc
+
+            try:
+                return await breaker.call(operation)
+            except CircuitOpenError as exc:
+                log.warning(
+                    "llm call skipped: circuit open",
+                    extra={
+                        "provider": self.provider,
+                        "model": self.model,
+                        "circuit_state": breaker.state.value,
+                    },
+                )
+                raise LLMError(f"{self.provider} circuit open: {exc}") from exc
+            except Exception as exc:
+                last_exc = exc
+                category = classify_exception(exc)
+                retryable = category is RetryableError
+                if not retryable or attempt > self.max_retries:
+                    log.error(
+                        "llm call failed, not retrying",
+                        extra={
+                            "provider": self.provider,
+                            "model": self.model,
+                            "retry_count": attempt,
+                            "error_category": category.__name__,
+                            "reason": str(exc),
+                        },
+                    )
+                    raise LLMError(f"{self.provider} request failed: {exc}") from exc
+
+                delay = self._backoff_delay(attempt)
+                log.warning(
+                    "llm call failed, retrying",
+                    extra={
+                        "provider": self.provider,
+                        "model": self.model,
+                        "retry_count": attempt,
+                        "retry_delay_seconds": delay,
+                        "reason": str(exc),
+                    },
+                )
+                await asyncio.sleep(delay)
+
+        raise LLMError(f"{self.provider} request failed after retries: {last_exc}")
 
     def _log_usage(self, response: LLMResponse) -> None:
         log.info(
@@ -175,27 +291,24 @@ class AnthropicClient(_BaseLLMClient):
     ) -> LLMResponse:
         async def _call() -> LLMResponse:
             started = time.monotonic()
-            try:
-                async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-                    resp = await client.post(
-                        "https://api.anthropic.com/v1/messages",
-                        headers={
-                            "x-api-key": self.api_key,
-                            "anthropic-version": "2023-06-01",
-                            "content-type": "application/json",
-                        },
-                        json={
-                            "model": self.model,
-                            "max_tokens": max_tokens,
-                            "temperature": temperature,
-                            "system": system,
-                            "messages": [{"role": "user", "content": prompt}],
-                        },
-                    )
-                    resp.raise_for_status()
-                    data = resp.json()
-            except httpx.HTTPError as exc:
-                raise LLMError(f"anthropic request failed: {exc}") from exc
+            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+                resp = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={
+                        "x-api-key": self.api_key,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    },
+                    json={
+                        "model": self.model,
+                        "max_tokens": max_tokens,
+                        "temperature": temperature,
+                        "system": system,
+                        "messages": [{"role": "user", "content": prompt}],
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
 
             latency_ms = (time.monotonic() - started) * 1000
             try:
@@ -213,12 +326,12 @@ class AnthropicClient(_BaseLLMClient):
                     finish_reason=data.get("stop_reason"),
                 )
             except (KeyError, TypeError, ValueError) as exc:
-                raise LLMError(f"anthropic response malformed: {exc}") from exc
+                raise PoisonMessageError(f"anthropic response malformed: {exc}") from exc
 
             self._log_usage(response)
             return response
 
-        return await self._retrying(_call)
+        return await self._execute_with_resilience(_call)
 
 
 class OpenAIClient(_BaseLLMClient):
@@ -235,28 +348,25 @@ class OpenAIClient(_BaseLLMClient):
     ) -> LLMResponse:
         async def _call() -> LLMResponse:
             started = time.monotonic()
-            try:
-                async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-                    resp = await client.post(
-                        "https://api.openai.com/v1/chat/completions",
-                        headers={
-                            "Authorization": f"Bearer {self.api_key}",
-                            "content-type": "application/json",
-                        },
-                        json={
-                            "model": self.model,
-                            "max_tokens": max_tokens,
-                            "temperature": temperature,
-                            "messages": [
-                                {"role": "system", "content": system},
-                                {"role": "user", "content": prompt},
-                            ],
-                        },
-                    )
-                    resp.raise_for_status()
-                    data = resp.json()
-            except httpx.HTTPError as exc:
-                raise LLMError(f"openai request failed: {exc}") from exc
+            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+                resp = await client.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "content-type": "application/json",
+                    },
+                    json={
+                        "model": self.model,
+                        "max_tokens": max_tokens,
+                        "temperature": temperature,
+                        "messages": [
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": prompt},
+                        ],
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
 
             latency_ms = (time.monotonic() - started) * 1000
             try:
@@ -272,12 +382,12 @@ class OpenAIClient(_BaseLLMClient):
                     finish_reason=choice.get("finish_reason"),
                 )
             except (KeyError, TypeError, ValueError, IndexError) as exc:
-                raise LLMError(f"openai response malformed: {exc}") from exc
+                raise PoisonMessageError(f"openai response malformed: {exc}") from exc
 
             self._log_usage(response)
             return response
 
-        return await self._retrying(_call)
+        return await self._execute_with_resilience(_call)
 
 
 class OllamaClient(_BaseLLMClient):
@@ -294,24 +404,21 @@ class OllamaClient(_BaseLLMClient):
     ) -> LLMResponse:
         async def _call() -> LLMResponse:
             started = time.monotonic()
-            try:
-                async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-                    resp = await client.post(
-                        f"{self.base_url}/api/chat",
-                        json={
-                            "model": self.model,
-                            "stream": False,
-                            "options": {"temperature": temperature, "num_predict": max_tokens},
-                            "messages": [
-                                {"role": "system", "content": system},
-                                {"role": "user", "content": prompt},
-                            ],
-                        },
-                    )
-                    resp.raise_for_status()
-                    data = resp.json()
-            except httpx.HTTPError as exc:
-                raise LLMError(f"ollama request failed: {exc}") from exc
+            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+                resp = await client.post(
+                    f"{self.base_url}/api/chat",
+                    json={
+                        "model": self.model,
+                        "stream": False,
+                        "options": {"temperature": temperature, "num_predict": max_tokens},
+                        "messages": [
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": prompt},
+                        ],
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
 
             latency_ms = (time.monotonic() - started) * 1000
             try:
@@ -325,12 +432,12 @@ class OllamaClient(_BaseLLMClient):
                     finish_reason="stop" if data.get("done") else None,
                 )
             except (KeyError, TypeError, ValueError) as exc:
-                raise LLMError(f"ollama response malformed: {exc}") from exc
+                raise PoisonMessageError(f"ollama response malformed: {exc}") from exc
 
             self._log_usage(response)
             return response
 
-        return await self._retrying(_call)
+        return await self._execute_with_resilience(_call)
 
 
 class NullLLMClient:

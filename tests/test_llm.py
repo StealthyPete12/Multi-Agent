@@ -94,7 +94,7 @@ async def test_anthropic_client_success(httpx_mock):
             "stop_reason": "end_turn",
         },
     )
-    client = AnthropicClient(api_key="sk-test", model="claude-haiku-4-5-20251001")
+    client = AnthropicClient(api_key="sk-test", model="claude-haiku-4-5-20251001", rate_limit_enabled=False)
     response = await client.complete(system="sys", prompt="hi", max_tokens=50)
     assert response.text == "a short summary."
     assert response.provider == "anthropic"
@@ -103,15 +103,19 @@ async def test_anthropic_client_success(httpx_mock):
 
 
 async def test_anthropic_client_http_error_raises_llm_error(httpx_mock):
+    # 500 is retryable (see tests/test_llm_retry.py for dedicated retry
+    # coverage); pin max_retries=0 here so this test asserts only the
+    # single-attempt-exhausted -> LLMError behavior, matching one mocked
+    # response.
     httpx_mock.add_response(url="https://api.anthropic.com/v1/messages", status_code=500)
-    client = AnthropicClient(api_key="sk-test", model="m")
+    client = AnthropicClient(api_key="sk-test", model="m", max_retries=0, rate_limit_enabled=False)
     with pytest.raises(LLMError):
         await client.complete(system="sys", prompt="hi", max_tokens=50)
 
 
 async def test_anthropic_client_malformed_response_raises_llm_error(httpx_mock):
     httpx_mock.add_response(url="https://api.anthropic.com/v1/messages", json={"nope": True})
-    client = AnthropicClient(api_key="sk-test", model="m")
+    client = AnthropicClient(api_key="sk-test", model="m", rate_limit_enabled=False)
     with pytest.raises(LLMError):
         await client.complete(system="sys", prompt="hi", max_tokens=50)
 
@@ -125,7 +129,7 @@ async def test_openai_client_success(httpx_mock):
             "usage": {"prompt_tokens": 5, "completion_tokens": 3},
         },
     )
-    client = OpenAIClient(api_key="sk-test", model="gpt-4o-mini")
+    client = OpenAIClient(api_key="sk-test", model="gpt-4o-mini", rate_limit_enabled=False)
     response = await client.complete(system="sys", prompt="hi", max_tokens=50)
     assert response.text == "hello"
     assert response.provider == "openai"
@@ -144,7 +148,7 @@ async def test_ollama_client_success(httpx_mock):
             "done": True,
         },
     )
-    client = OllamaClient(base_url="http://localhost:11434", model="llama3.1")
+    client = OllamaClient(base_url="http://localhost:11434", model="llama3.1", rate_limit_enabled=False)
     response = await client.complete(system="sys", prompt="hi", max_tokens=50)
     assert response.text == "a summary"
     assert response.provider == "ollama"
