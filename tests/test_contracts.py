@@ -4,6 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from shared.contracts import (
+    BlastRadius,
     CommitDetected,
     Envelope,
     EventType,
@@ -54,6 +55,15 @@ def test_findings_ready_round_trip_via_parse_envelope():
         findings=[finding],
         started_at=_now(),
         completed_at=_now(),
+        repo="acme/widgets",
+        changed_files=["widgets/core.py"],
+        blast_radius=BlastRadius(
+            impacted_modules=["widgets.core", "widgets.api"],
+            impact_count=2,
+            max_depth=1,
+        ),
+        sensitive_hits=[],
+        semantic_summary="",
     )
     envelope = make_envelope(payload, event_type=EventType.FINDINGS_READY, source="analysis-agent")
 
@@ -61,6 +71,7 @@ def test_findings_ready_round_trip_via_parse_envelope():
 
     assert isinstance(restored.payload, FindingsReady)
     assert restored.payload.findings[0].severity == "high"
+    assert restored.payload.blast_radius.impact_count == 2
 
 
 def test_review_completed_round_trip():

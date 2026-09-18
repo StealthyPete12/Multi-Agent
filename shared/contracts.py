@@ -29,6 +29,7 @@ __all__ = [
     "EventType",
     "ContractModel",
     "Finding",
+    "BlastRadius",
     "CommitDetected",
     "FindingsReady",
     "ReviewCompleted",
@@ -95,9 +96,24 @@ class CommitDetected(ContractModel):
     changed_files: list[str] = Field(default_factory=list)
 
 
+class BlastRadius(ContractModel):
+    """Result of a repository-analysis agent's dependency-impact traversal
+    for the commit's changed files (see ``agents/researcher/impact.py``)."""
+
+    impacted_modules: list[str] = Field(default_factory=list)
+    impact_count: int = Field(ge=0, default=0)
+    max_depth: int = Field(ge=0, default=0)
+
+
 class FindingsReady(ContractModel):
     """Published by an analysis agent once it has finished reviewing a
-    commit, whether or not it produced any findings."""
+    commit, whether or not it produced any findings.
+
+    Phase 2 adds repository-intelligence fields (``repo``, ``changed_files``,
+    ``blast_radius``, ``sensitive_hits``) alongside the original Phase 1
+    fields. ``semantic_summary`` is reserved for a future LLM-based agent —
+    Phase 2 always publishes it as ``""``.
+    """
 
     SCHEMA_VERSION: ClassVar[str] = "1.0"
 
@@ -107,6 +123,11 @@ class FindingsReady(ContractModel):
     findings: list[Finding] = Field(default_factory=list)
     started_at: datetime
     completed_at: datetime
+    repo: str
+    changed_files: list[str] = Field(default_factory=list)
+    blast_radius: BlastRadius = Field(default_factory=BlastRadius)
+    sensitive_hits: list[str] = Field(default_factory=list)
+    semantic_summary: str = ""
 
 
 class ReviewCompleted(ContractModel):
