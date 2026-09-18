@@ -37,7 +37,9 @@ from dataclasses import dataclass
 from typing import Awaitable, Callable, Protocol, TypeVar, runtime_checkable
 
 import httpx
+from opentelemetry.trace import SpanKind
 
+from shared import telemetry
 from shared.breaker import CircuitOpenError, get_circuit_breaker
 from shared.errors import PoisonMessageError, RetryableError, classify_exception
 from shared.logging import configure_logging
@@ -212,56 +214,91 @@ class _BaseLLMClient:
             open_duration_seconds=self.breaker_open_seconds,
         )
 
-        last_exc: Exception | None = None
-        for attempt in range(1, self.max_retries + 2):
-            try:
-                await self._acquire_rate_limit()
-            except TimeoutError as exc:
-                raise LLMError(f"{self.provider} rate limit wait exceeded: {exc}") from exc
+        with telemetry.span(
+            "llm.request",
+            kind=SpanKind.CLIENT,
+            tracer_name="shared.llm",
+            attributes={"llm.provider": self.provider, "llm.model": self.model},
+        ) as current_span:
+            last_exc: Exception | None = None
+            for attempt in range(1, self.max_retries + 2):
+                try:
+                    await self._acquire_rate_limit()
+                except TimeoutError as exc:
+                    telemetry.record_llm_failure(
+                        provider=self.provider, model=self.model, reason="rate_limit_timeout"
+                    )
+                    raise LLMError(f"{self.provider} rate limit wait exceeded: {exc}") from exc
 
-            try:
-                return await breaker.call(operation)
-            except CircuitOpenError as exc:
-                log.warning(
-                    "llm call skipped: circuit open",
-                    extra={
-                        "provider": self.provider,
-                        "model": self.model,
-                        "circuit_state": breaker.state.value,
-                    },
-                )
-                raise LLMError(f"{self.provider} circuit open: {exc}") from exc
-            except Exception as exc:
-                last_exc = exc
-                category = classify_exception(exc)
-                retryable = category is RetryableError
-                if not retryable or attempt > self.max_retries:
-                    log.error(
-                        "llm call failed, not retrying",
+                try:
+                    result = await breaker.call(operation)
+                    current_span.set_attribute("llm.retry_count", attempt - 1)
+                    current_span.set_attribute("llm.breaker_state", breaker.state.value)
+                    telemetry.get_metrics().llm_calls.add(
+                        1, {"provider": self.provider, "model": self.model, "outcome": "success"}
+                    )
+                    return result
+                except CircuitOpenError as exc:
+                    log.warning(
+                        "llm call skipped: circuit open",
+                        extra={
+                            "provider": self.provider,
+                            "model": self.model,
+                            "circuit_state": breaker.state.value,
+                        },
+                    )
+                    current_span.set_attribute("llm.breaker_state", breaker.state.value)
+                    telemetry.get_metrics().llm_calls.add(
+                        1, {"provider": self.provider, "model": self.model, "outcome": "circuit_open"}
+                    )
+                    telemetry.record_llm_failure(
+                        provider=self.provider, model=self.model, reason="circuit_open"
+                    )
+                    raise LLMError(f"{self.provider} circuit open: {exc}") from exc
+                except Exception as exc:
+                    last_exc = exc
+                    category = classify_exception(exc)
+                    retryable = category is RetryableError
+                    if not retryable or attempt > self.max_retries:
+                        log.error(
+                            "llm call failed, not retrying",
+                            extra={
+                                "provider": self.provider,
+                                "model": self.model,
+                                "retry_count": attempt,
+                                "error_category": category.__name__,
+                                "reason": str(exc),
+                            },
+                        )
+                        current_span.set_attribute("llm.retry_count", attempt)
+                        telemetry.get_metrics().llm_calls.add(
+                            1, {"provider": self.provider, "model": self.model, "outcome": "failed"}
+                        )
+                        telemetry.record_llm_failure(
+                            provider=self.provider, model=self.model, reason=category.__name__
+                        )
+                        raise LLMError(f"{self.provider} request failed: {exc}") from exc
+
+                    delay = self._backoff_delay(attempt)
+                    log.warning(
+                        "llm call failed, retrying",
                         extra={
                             "provider": self.provider,
                             "model": self.model,
                             "retry_count": attempt,
-                            "error_category": category.__name__,
+                            "retry_delay_seconds": delay,
                             "reason": str(exc),
                         },
                     )
-                    raise LLMError(f"{self.provider} request failed: {exc}") from exc
+                    telemetry.get_metrics().retry_count.add(
+                        1, {"component": "llm", "provider": self.provider, "model": self.model}
+                    )
+                    await asyncio.sleep(delay)
 
-                delay = self._backoff_delay(attempt)
-                log.warning(
-                    "llm call failed, retrying",
-                    extra={
-                        "provider": self.provider,
-                        "model": self.model,
-                        "retry_count": attempt,
-                        "retry_delay_seconds": delay,
-                        "reason": str(exc),
-                    },
-                )
-                await asyncio.sleep(delay)
-
-        raise LLMError(f"{self.provider} request failed after retries: {last_exc}")
+            telemetry.get_metrics().llm_calls.add(
+                1, {"provider": self.provider, "model": self.model, "outcome": "failed"}
+            )
+            raise LLMError(f"{self.provider} request failed after retries: {last_exc}")
 
     def _log_usage(self, response: LLMResponse) -> None:
         log.info(
@@ -272,7 +309,16 @@ class _BaseLLMClient:
                 "input_tokens": response.input_tokens,
                 "output_tokens": response.output_tokens,
                 "latency_ms": response.latency_ms,
+                "duration_ms": response.latency_ms,
+                "event_type": "llm.completion",
             },
+        )
+        telemetry.record_llm_success(
+            provider=response.provider,
+            model=response.model,
+            input_tokens=response.input_tokens,
+            output_tokens=response.output_tokens,
+            latency_ms=response.latency_ms,
         )
 
 

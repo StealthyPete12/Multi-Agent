@@ -52,6 +52,7 @@ from typing import TYPE_CHECKING
 import aio_pika
 from aio_pika import ExchangeType
 
+from shared import telemetry
 from shared.logging import configure_logging
 
 if TYPE_CHECKING:
@@ -228,6 +229,7 @@ class RetryLadder:
                 "original_queue": original_queue,
             },
         )
+        telemetry.get_metrics().retry_count.add(1, {"original_queue": original_queue, "rung": rung.name})
         return rung
 
     async def send_to_dlq(
@@ -274,6 +276,7 @@ class RetryLadder:
                 "original_queue": original_queue,
             },
         )
+        telemetry.get_metrics().dlq_count.add(1, {"original_queue": original_queue, "poison": "false"})
 
     async def send_raw_to_dlq(
         self,
@@ -309,3 +312,4 @@ class RetryLadder:
                 "original_queue": original_queue,
             },
         )
+        telemetry.get_metrics().dlq_count.add(1, {"original_queue": original_queue, "poison": "true"})

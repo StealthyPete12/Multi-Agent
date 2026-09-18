@@ -25,6 +25,7 @@ from dataclasses import dataclass
 
 import redis.asyncio as redis
 
+from shared import telemetry
 from shared.logging import configure_logging
 
 __all__ = ["RateLimiter", "RateLimitDecision", "get_rate_limiter", "get_redis_client"]
@@ -150,6 +151,9 @@ class RateLimiter:
                 "rate limiter delaying call",
                 extra={"rate_limiter_delay": sleep_for, "key": key},
             )
+            m = telemetry.get_metrics()
+            m.rate_limit_delays.add(1, {"key": key})
+            m.rate_limit_delay_seconds.record(sleep_for, {"key": key})
             await asyncio.sleep(sleep_for)
 
 

@@ -12,6 +12,9 @@ import os
 
 import httpx
 
+from opentelemetry.trace import SpanKind
+
+from shared import telemetry
 from shared.logging import configure_logging
 
 __all__ = [
@@ -127,16 +130,22 @@ class SlackNotifier:
         delivery actually fails, so a caller can tell "not set up" apart
         from "broken".
         """
-        if not self.is_configured:
-            log.info("slack webhook not configured, skipping notification")
+        with telemetry.span("slack.deliver", kind=SpanKind.CLIENT, tracer_name="shared.slack") as current_span:
+            if not self.is_configured:
+                log.info("slack webhook not configured, skipping notification")
+                current_span.set_attribute("slack.configured", False)
+                telemetry.get_metrics().slack_deliveries.add(1, {"outcome": "not_configured"})
+                return True
+
+            current_span.set_attribute("slack.configured", True)
+            try:
+                async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+                    resp = await client.post(self.webhook_url, json=payload)
+                    resp.raise_for_status()
+            except httpx.HTTPError as exc:
+                telemetry.get_metrics().slack_deliveries.add(1, {"outcome": "failed"})
+                raise SlackError(f"slack delivery failed: {exc}") from exc
+
+            log.info("slack notification delivered")
+            telemetry.get_metrics().slack_deliveries.add(1, {"outcome": "delivered"})
             return True
-
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-                resp = await client.post(self.webhook_url, json=payload)
-                resp.raise_for_status()
-        except httpx.HTTPError as exc:
-            raise SlackError(f"slack delivery failed: {exc}") from exc
-
-        log.info("slack notification delivered")
-        return True

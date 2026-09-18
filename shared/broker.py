@@ -40,6 +40,8 @@ from typing import TYPE_CHECKING
 import aio_pika
 from aio_pika import ExchangeType
 
+from shared import telemetry
+
 if TYPE_CHECKING:
     from aio_pika.abc import (
         AbstractChannel,
@@ -146,17 +148,38 @@ class Broker:
         Raises if the broker nacks the publish (e.g. no route, internal
         error) so callers can retry or surface the failure rather than
         silently losing the event.
+
+        Opens a PRODUCER span and injects its W3C trace context into the
+        message headers (alongside the existing business ``trace_id``) so
+        the consuming service's span continues the same OTel trace instead
+        of starting an orphaned one.
         """
-        message = aio_pika.Message(
-            body=envelope.to_bytes(),
-            content_type="application/json",
-            delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
-            message_id=envelope.event_id,
-            correlation_id=envelope.correlation_id,
-            type=envelope.event_type.value,
-            headers={"trace_id": envelope.trace_id},
+        headers: dict = {"trace_id": envelope.trace_id}
+        with telemetry.producer_span(
+            f"rabbitmq.publish {routing_key}",
+            headers,
+            attributes={
+                "messaging.system": "rabbitmq",
+                "messaging.destination.name": self.exchange_name,
+                "messaging.rabbitmq.routing_key": routing_key,
+                "messaging.message.id": envelope.event_id,
+                "swarm.event_type": envelope.event_type.value,
+                "swarm.trace_id": envelope.trace_id,
+            },
+        ):
+            message = aio_pika.Message(
+                body=envelope.to_bytes(),
+                content_type="application/json",
+                delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+                message_id=envelope.event_id,
+                correlation_id=envelope.correlation_id,
+                type=envelope.event_type.value,
+                headers=headers,
+            )
+            await self.exchange.publish(message, routing_key=routing_key)
+        telemetry.get_metrics().events_processed.add(
+            1, {"event_type": envelope.event_type.value, "direction": "published"}
         )
-        await self.exchange.publish(message, routing_key=routing_key)
 
     async def declare_queue(
         self,

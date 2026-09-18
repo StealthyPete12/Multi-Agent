@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Awaitable, Callable, TypeVar
 
+from shared import telemetry
 from shared.logging import configure_logging
 
 __all__ = ["CircuitState", "CircuitBreaker", "CircuitOpenError", "BreakerMetrics"]
@@ -118,6 +119,7 @@ class CircuitBreaker:
                 "open_count": self.metrics.open_count,
             },
         )
+        telemetry.get_metrics().breaker_opens.add(1, {"breaker": self.name})
 
     async def call(self, fn: Callable[[], Awaitable[T]]) -> T:
         """Run ``fn()`` through the breaker: fails fast with

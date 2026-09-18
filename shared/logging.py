@@ -24,6 +24,25 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+try:
+    from opentelemetry import trace as _otel_trace
+except ImportError:  # pragma: no cover - opentelemetry is a hard dependency in practice
+    _otel_trace = None
+
+
+def _otel_trace_id() -> str | None:
+    if _otel_trace is None:
+        return None
+    ctx = _otel_trace.get_current_span().get_span_context()
+    return format(ctx.trace_id, "032x") if ctx.is_valid else None
+
+
+def _otel_span_id() -> str | None:
+    if _otel_trace is None:
+        return None
+    ctx = _otel_trace.get_current_span().get_span_context()
+    return format(ctx.span_id, "016x") if ctx.is_valid else None
+
 __all__ = [
     "configure_logging",
     "get_logger",
@@ -85,11 +104,14 @@ class JsonFormatter(logging.Formatter):
                 record.created, tz=timezone.utc
             ).isoformat(),
             "level": record.levelname,
+            "severity": record.levelname,
             "service": self.service_name,
             "logger": record.name,
             "message": record.getMessage(),
             "trace_id": _trace_id_var.get(),
             "correlation_id": _correlation_id_var.get(),
+            "otel_trace_id": _otel_trace_id(),
+            "otel_span_id": _otel_span_id(),
         }
 
         for key, value in record.__dict__.items():
