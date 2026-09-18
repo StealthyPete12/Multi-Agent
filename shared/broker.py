@@ -79,6 +79,12 @@ class Broker:
         self.prefetch_count = prefetch_count or int(
             os.environ.get("RABBITMQ_PREFETCH", DEFAULT_PREFETCH)
         )
+        # AMQP heartbeat (seconds) — lets both sides detect a dead TCP
+        # connection (e.g. a silently dropped network path) well before a
+        # kernel-level timeout would, so a stuck consumer doesn't hold a
+        # message unacked indefinitely. aio_pika's default is already 60s;
+        # exposed here so it's configurable without editing code.
+        self.heartbeat = int(os.environ.get("RABBITMQ_HEARTBEAT", 60))
 
         self._connection: AbstractRobustConnection | None = None
         self._channel: AbstractChannel | None = None
@@ -94,7 +100,7 @@ class Broker:
         if self._connection is not None:
             return
 
-        self._connection = await aio_pika.connect_robust(self.url)
+        self._connection = await aio_pika.connect_robust(self.url, heartbeat=self.heartbeat)
         # publisher_confirms=True (the aio-pika default) makes every
         # `exchange.publish(...)` await the broker's ack/nack instead of
         # firing and forgetting.

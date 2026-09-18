@@ -22,11 +22,13 @@ Run with::
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import signal
 import time
 from datetime import datetime, timezone
 
+import asyncpg
 from pydantic import ValidationError
 
 from agents.reviewer.prompts import (
@@ -39,14 +41,40 @@ from agents.reviewer.scoring import ScoreBreakdown, compute_score, status_for_se
 from agents.reviewer.storage import ReviewStorage
 from shared.broker import Broker
 from shared.contracts import Envelope, EventType, FindingsReady, ReviewCompleted, make_envelope
+from shared.errors import FatalError, PoisonMessageError, RetryableError, classify_exception
+from shared.idempotency import IdempotencyStore
 from shared.llm import LLMClient, LLMError, get_llm_client
 from shared.logging import configure_logging, trace_context
-from shared.slack import SlackNotifier, build_review_message
+from shared.retry import MAX_RETRY_ATTEMPTS, RetryLadder
+from shared.slack import SlackError, SlackNotifier, build_review_message
 
 QUEUE_FINDINGS = os.environ.get("QUEUE_FINDINGS", "q.findings")
 QUEUE_REVIEWS = os.environ.get("QUEUE_REVIEWS", "q.reviews")
 
 log = configure_logging(service_name="reviewer")
+
+
+def classify_reviewer_failure(exc: Exception) -> type[RetryableError | PoisonMessageError | FatalError]:
+    """Map a failure from ``process_findings``'s pipeline (Postgres,
+    Slack) to one of the three Phase 4 error categories. Kept in the
+    consumer, not ``shared/errors.py``, for the same layering reason as
+    the researcher's ``classify_researcher_failure``."""
+    if isinstance(exc, SlackError):
+        # SlackError always wraps an httpx.HTTPError (see shared/slack.py)
+        # — delegate to the same HTTP-status/network classification the
+        # LLM client uses.
+        cause = exc.__cause__
+        if cause is not None:
+            return classify_exception(cause)
+        return RetryableError
+    if isinstance(exc, (ConnectionError, TimeoutError, OSError, asyncpg.PostgresConnectionError)):
+        return RetryableError
+    if isinstance(exc, LLMError):
+        # generate_narrative() already degrades LLM failures to the
+        # deterministic fallback template internally and never lets
+        # LLMError escape — this branch is defensive only.
+        return RetryableError
+    return classify_exception(exc)
 
 
 async def generate_narrative(
@@ -166,35 +194,61 @@ async def handle_message(
     storage: ReviewStorage,
     llm_client: LLMClient,
     slack: SlackNotifier,
+    retry_ladder: RetryLadder,
+    idempotency: IdempotencyStore,
 ) -> None:
     """Validate, review, publish `review.completed`, then ack/nack one
-    `findings.ready` message.
-
-    Rejects (without requeue) messages that fail contract validation so
-    they dead-letter instead of blocking the queue on redelivery.
+    `findings.ready` message — manual acknowledgement throughout, mirroring
+    ``agents/researcher/main.py::handle_message``'s Phase 4 routing:
+    poison -> DLQ immediately, retryable -> retry ladder (claim released
+    so a later attempt can reclaim), fatal -> log, nack-with-requeue, stop
+    the service. ``process_findings``/``storage.py`` (the actual scoring,
+    narrative, persistence, Slack logic) are unchanged from Phase 3.
     """
-    async with message.process(ignore_processed=True, requeue=False):
-        try:
-            envelope = Envelope[FindingsReady].from_json(message.body)
-        except ValidationError:
-            log.exception(
-                "rejected message: contract validation failed",
-                extra={"raw_body": message.body.decode("utf-8", errors="replace")},
-            )
-            raise
+    try:
+        envelope = Envelope[FindingsReady].from_json(message.body)
+    except ValidationError as exc:
+        log.exception(
+            "rejected message: contract validation failed",
+            extra={"raw_body": message.body.decode("utf-8", errors="replace")},
+        )
+        await retry_ladder.send_raw_to_dlq(
+            message.body,
+            reason=f"contract validation failed: {exc}",
+            original_queue=QUEUE_FINDINGS,
+        )
+        await message.ack()
+        return
 
-        with trace_context(trace_id=envelope.trace_id, correlation_id=envelope.event_id):
+    attempt = RetryLadder.attempt_from_headers(message.headers)
+
+    with trace_context(trace_id=envelope.trace_id, correlation_id=envelope.event_id):
+        log.info(
+            "findings.ready received",
+            extra={
+                "event_id": envelope.event_id,
+                "repo": envelope.payload.repo,
+                "commit_sha": envelope.payload.commit_sha,
+                "impact_count": envelope.payload.blast_radius.impact_count,
+                "sensitive_hits": len(envelope.payload.sensitive_hits),
+                "retry_count": attempt,
+            },
+        )
+
+        claimed = await idempotency.claim(
+            event_id=envelope.event_id,
+            event_type=envelope.event_type.value,
+            trace_id=envelope.trace_id,
+        )
+        if not claimed:
             log.info(
-                "findings.ready received",
-                extra={
-                    "event_id": envelope.event_id,
-                    "repo": envelope.payload.repo,
-                    "commit_sha": envelope.payload.commit_sha,
-                    "impact_count": envelope.payload.blast_radius.impact_count,
-                    "sensitive_hits": len(envelope.payload.sensitive_hits),
-                },
+                "duplicate delivery, skipping (already processed)",
+                extra={"event_id": envelope.event_id},
             )
+            await message.ack()
+            return
 
+        try:
             review = await process_findings(
                 envelope.payload,
                 event_id=envelope.event_id,
@@ -204,6 +258,10 @@ async def handle_message(
                 slack=slack,
             )
             if review is None:
+                # storage.is_processed() found it already fully persisted
+                # (e.g. the outer claim above raced with a prior in-flight
+                # completion) — nothing left to do.
+                await message.ack()
                 return
 
             review_envelope = make_envelope(
@@ -224,10 +282,51 @@ async def handle_message(
                     "report_id": review.report_id,
                 },
             )
+            await message.ack()
+        except Exception as exc:
+            category = classify_reviewer_failure(exc)
+
+            if category is PoisonMessageError:
+                await idempotency.release(envelope.event_id)
+                await retry_ladder.send_to_dlq(
+                    envelope, reason=str(exc), attempt=attempt, original_queue=QUEUE_FINDINGS
+                )
+                await message.ack()
+                return
+
+            if category is FatalError:
+                log.critical(
+                    "fatal error in reviewer pipeline, stopping service",
+                    extra={"reason": str(exc), "event_id": envelope.event_id},
+                )
+                await idempotency.release(envelope.event_id)
+                await message.nack(requeue=True)
+                raise FatalError(str(exc)) from exc
+
+            await idempotency.release(envelope.event_id)
+            next_attempt = attempt + 1
+            if next_attempt > MAX_RETRY_ATTEMPTS:
+                await retry_ladder.send_to_dlq(
+                    envelope, reason=str(exc), attempt=next_attempt, original_queue=QUEUE_FINDINGS
+                )
+            else:
+                await retry_ladder.schedule_retry(
+                    envelope,
+                    routing_key=EventType.FINDINGS_READY.value,
+                    reason=str(exc),
+                    attempt=next_attempt,
+                    original_queue=QUEUE_FINDINGS,
+                )
+            await message.ack()
+
+
+GRACEFUL_SHUTDOWN_SECONDS = float(os.environ.get("GRACEFUL_SHUTDOWN_SECONDS", "30"))
 
 
 async def run() -> None:
-    broker = Broker()
+    # prefetch_count=1: see agents/researcher/main.py::run for the same
+    # rationale — exactly one unacked findings.ready in flight at a time.
+    broker = Broker(prefetch_count=1)
     await broker.connect()
     queue = await broker.declare_queue(
         QUEUE_FINDINGS, routing_keys=[EventType.FINDINGS_READY.value]
@@ -236,8 +335,12 @@ async def run() -> None:
     # binds to it, matching how researcher pre-declares q.findings.
     await broker.declare_queue(QUEUE_REVIEWS, routing_keys=[EventType.REVIEW_COMPLETED.value])
 
+    retry_ladder = RetryLadder(broker)
+    await retry_ladder.declare_topology()
+
     storage = ReviewStorage()
     await storage.connect()
+    idempotency = IdempotencyStore(storage.pool)
     llm_client = get_llm_client(purpose="narrative")
     slack = SlackNotifier()
 
@@ -248,6 +351,7 @@ async def run() -> None:
             "publishes_to": QUEUE_REVIEWS,
             "llm_provider": llm_client.provider,
             "slack_configured": slack.is_configured,
+            "prefetch_count": broker.prefetch_count,
         },
     )
 
@@ -256,16 +360,47 @@ async def run() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop_event.set)
 
+    fatal_error: BaseException | None = None
     async with queue.iterator() as queue_iter:
         consume_task = asyncio.create_task(
-            _consume(queue_iter, broker=broker, storage=storage, llm_client=llm_client, slack=slack)
+            _consume(
+                queue_iter,
+                broker=broker,
+                storage=storage,
+                llm_client=llm_client,
+                slack=slack,
+                retry_ladder=retry_ladder,
+                idempotency=idempotency,
+            )
         )
-        await stop_event.wait()
-        consume_task.cancel()
+        stop_wait_task = asyncio.create_task(stop_event.wait())
+        done, _pending = await asyncio.wait(
+            {consume_task, stop_wait_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+
+        if consume_task in done and consume_task.exception() is not None:
+            fatal_error = consume_task.exception()
+        else:
+            log.info(
+                "shutdown signal received, draining in-flight work",
+                extra={"grace_period_seconds": GRACEFUL_SHUTDOWN_SECONDS},
+            )
+            try:
+                await asyncio.wait_for(consume_task, timeout=GRACEFUL_SHUTDOWN_SECONDS)
+            except asyncio.TimeoutError:
+                log.warning("graceful shutdown window elapsed, cancelling consumer")
+                consume_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await consume_task
+            except Exception as exc:  # pragma: no cover - defensive
+                fatal_error = exc
+        stop_wait_task.cancel()
 
     await storage.close()
     await broker.close()
     log.info("reviewer stopped")
+    if fatal_error is not None:
+        raise fatal_error
 
 
 async def _consume(
@@ -275,13 +410,27 @@ async def _consume(
     storage: ReviewStorage,
     llm_client: LLMClient,
     slack: SlackNotifier,
+    retry_ladder: RetryLadder,
+    idempotency: IdempotencyStore,
 ) -> None:
     async for message in queue_iter:
-        await handle_message(message, broker=broker, storage=storage, llm_client=llm_client, slack=slack)
+        await handle_message(
+            message,
+            broker=broker,
+            storage=storage,
+            llm_client=llm_client,
+            slack=slack,
+            retry_ladder=retry_ladder,
+            idempotency=idempotency,
+        )
 
 
 def main() -> None:
-    asyncio.run(run())
+    try:
+        asyncio.run(run())
+    except FatalError as exc:
+        log.critical("reviewer stopped due to fatal error", extra={"reason": str(exc)})
+        raise SystemExit(1) from exc
 
 
 if __name__ == "__main__":

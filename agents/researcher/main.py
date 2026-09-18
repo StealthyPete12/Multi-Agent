@@ -21,18 +21,20 @@ Run with::
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import signal
 import time
 from datetime import datetime, timezone
 
+import asyncpg
 from pydantic import ValidationError
 
 from agents.researcher.db import Database
 from agents.researcher.diff import get_truncated_diff
 from agents.researcher.graph import build_dependency_graph
 from agents.researcher.impact import DEFAULT_MAX_DEPTH, changed_files_to_modules
-from agents.researcher.repository import RepositoryCache
+from agents.researcher.repository import CommitNotFoundError, GitCommandError, RepositoryCache
 from agents.researcher.sensitive import detect_sensitive_hits
 from agents.researcher.summarize import generate_semantic_summary
 from shared.broker import Broker
@@ -44,14 +46,45 @@ from shared.contracts import (
     FindingsReady,
     make_envelope,
 )
-from shared.llm import LLMClient, get_llm_client
+from shared.errors import FatalError, PoisonMessageError, RetryableError, classify_exception
+from shared.idempotency import IdempotencyStore
+from shared.llm import LLMClient, LLMError, get_llm_client
 from shared.logging import configure_logging, trace_context
+from shared.retry import MAX_RETRY_ATTEMPTS, RetryLadder
 
 QUEUE_COMMITS = os.environ.get("QUEUE_COMMITS", "q.commits")
 QUEUE_FINDINGS = os.environ.get("QUEUE_FINDINGS", "q.findings")
 BLAST_RADIUS_MAX_DEPTH = int(os.environ.get("BLAST_RADIUS_MAX_DEPTH", DEFAULT_MAX_DEPTH))
 
 log = configure_logging(service_name="researcher")
+
+
+def classify_researcher_failure(exc: Exception) -> type[RetryableError | PoisonMessageError | FatalError]:
+    """Map a failure from ``analyze_commit``'s pipeline (repo clone, git,
+    Postgres, LLM) to one of the three Phase 4 error categories.
+
+    Kept in the consumer, not ``shared/errors.py``, because it needs
+    knowledge of researcher-specific exception types
+    (``CommitNotFoundError``/``GitCommandError``) that ``shared/`` must
+    not depend on (layering: shared/ is imported by agents/, never the
+    reverse).
+    """
+    if isinstance(exc, CommitNotFoundError):
+        # The commit genuinely doesn't exist in the repo even after an
+        # unshallow fetch — no amount of retrying changes that.
+        return PoisonMessageError
+    if isinstance(exc, GitCommandError):
+        # Clone/fetch failed — almost always a transient network/remote
+        # issue (DNS, connection reset, remote temporarily unavailable).
+        return RetryableError
+    if isinstance(exc, LLMError):
+        # analyze_commit() already degrades LLM failures to "" internally
+        # (see summarize.py) and never lets LLMError escape — this branch
+        # is defensive only.
+        return RetryableError
+    if isinstance(exc, (ConnectionError, TimeoutError, OSError, asyncpg.PostgresConnectionError)):
+        return RetryableError
+    return classify_exception(exc)
 
 
 async def analyze_commit(
@@ -141,36 +174,70 @@ async def handle_message(
     broker: Broker,
     repo_cache: RepositoryCache,
     database: Database,
+    retry_ladder: RetryLadder,
+    idempotency: IdempotencyStore,
     llm_client: LLMClient | None = None,
 ) -> None:
     """Validate, analyze, publish `findings.ready`, then ack/nack one
-    `commit.detected` message.
+    `commit.detected` message — with manual acknowledgement throughout so
+    every outcome (success, retryable failure, poison message) makes an
+    explicit, logged routing decision instead of relying on an
+    ack-on-success/nack-on-exception context manager.
 
-    Rejects (without requeue) messages that fail contract validation so
-    they dead-letter instead of blocking the queue on redelivery.
+    - Contract validation failure -> poison, straight to DLQ, no retries.
+    - A classified :class:`RetryableError` -> routed to the retry ladder
+      (or the DLQ once attempts are exhausted), idempotency claim
+      released so a later attempt can reclaim it.
+    - A classified :class:`PoisonMessageError` -> DLQ immediately.
+    - A classified :class:`FatalError` -> logged, message nacked with
+      requeue so it isn't lost, and re-raised so ``run()`` stops the
+      service instead of burning through the rest of the queue the same
+      broken way.
     """
-    async with message.process(ignore_processed=True, requeue=False):
-        try:
-            envelope = Envelope[CommitDetected].from_json(message.body)
-        except ValidationError:
-            log.exception(
-                "rejected message: contract validation failed",
-                extra={"raw_body": message.body.decode("utf-8", errors="replace")},
-            )
-            raise
+    try:
+        envelope = Envelope[CommitDetected].from_json(message.body)
+    except ValidationError as exc:
+        log.exception(
+            "rejected message: contract validation failed",
+            extra={"raw_body": message.body.decode("utf-8", errors="replace")},
+        )
+        await retry_ladder.send_raw_to_dlq(
+            message.body,
+            reason=f"contract validation failed: {exc}",
+            original_queue=QUEUE_COMMITS,
+        )
+        await message.ack()
+        return
 
-        with trace_context(trace_id=envelope.trace_id, correlation_id=envelope.event_id):
+    attempt = RetryLadder.attempt_from_headers(message.headers)
+
+    with trace_context(trace_id=envelope.trace_id, correlation_id=envelope.event_id):
+        log.info(
+            "commit.detected received",
+            extra={
+                "event_id": envelope.event_id,
+                "repo": envelope.payload.repo,
+                "commit_sha": envelope.payload.commit_sha,
+                "branch": envelope.payload.branch,
+                "changed_files": envelope.payload.changed_files,
+                "retry_count": attempt,
+            },
+        )
+
+        claimed = await idempotency.claim(
+            event_id=envelope.event_id,
+            event_type=envelope.event_type.value,
+            trace_id=envelope.trace_id,
+        )
+        if not claimed:
             log.info(
-                "commit.detected received",
-                extra={
-                    "event_id": envelope.event_id,
-                    "repo": envelope.payload.repo,
-                    "commit_sha": envelope.payload.commit_sha,
-                    "branch": envelope.payload.branch,
-                    "changed_files": envelope.payload.changed_files,
-                },
+                "duplicate delivery, skipping (already processed)",
+                extra={"event_id": envelope.event_id},
             )
+            await message.ack()
+            return
 
+        try:
             findings_payload = await analyze_commit(
                 envelope.payload, repo_cache=repo_cache, database=database, llm_client=llm_client
             )
@@ -191,10 +258,62 @@ async def handle_message(
                     "sensitive_hits": len(findings_payload.sensitive_hits),
                 },
             )
+            await message.ack()
+        except Exception as exc:
+            category = classify_researcher_failure(exc)
+
+            if category is PoisonMessageError:
+                await idempotency.release(envelope.event_id)
+                await retry_ladder.send_to_dlq(
+                    envelope,
+                    reason=str(exc),
+                    attempt=attempt,
+                    original_queue=QUEUE_COMMITS,
+                )
+                await message.ack()
+                return
+
+            if category is FatalError:
+                log.critical(
+                    "fatal error in researcher pipeline, stopping service",
+                    extra={"reason": str(exc), "event_id": envelope.event_id},
+                )
+                await idempotency.release(envelope.event_id)
+                await message.nack(requeue=True)
+                raise FatalError(str(exc)) from exc
+
+            # RetryableError (or anything unclassified defaulting to it
+            # via the researcher's own classify_researcher_failure).
+            await idempotency.release(envelope.event_id)
+            next_attempt = attempt + 1
+            if next_attempt > MAX_RETRY_ATTEMPTS:
+                await retry_ladder.send_to_dlq(
+                    envelope,
+                    reason=str(exc),
+                    attempt=next_attempt,
+                    original_queue=QUEUE_COMMITS,
+                )
+            else:
+                await retry_ladder.schedule_retry(
+                    envelope,
+                    routing_key=EventType.COMMIT_DETECTED.value,
+                    reason=str(exc),
+                    attempt=next_attempt,
+                    original_queue=QUEUE_COMMITS,
+                )
+            await message.ack()
+
+
+GRACEFUL_SHUTDOWN_SECONDS = float(os.environ.get("GRACEFUL_SHUTDOWN_SECONDS", "30"))
 
 
 async def run() -> None:
-    broker = Broker()
+    # prefetch_count=1: at most one unacked commit.detected in flight at a
+    # time, so manual ack/nack below always reflects exactly the message
+    # currently being handled — no risk of acking/nacking the wrong one,
+    # and no batch of already-delivered-but-unprocessed messages to lose
+    # on a hard shutdown.
+    broker = Broker(prefetch_count=1)
     await broker.connect()
     queue = await broker.declare_queue(
         QUEUE_COMMITS, routing_keys=[EventType.COMMIT_DETECTED.value]
@@ -203,9 +322,13 @@ async def run() -> None:
     # binds to it, matching how the watcher pre-declares q.commits.
     await broker.declare_queue(QUEUE_FINDINGS, routing_keys=[EventType.FINDINGS_READY.value])
 
+    retry_ladder = RetryLadder(broker)
+    await retry_ladder.declare_topology()
+
     repo_cache = RepositoryCache()
     database = Database()
     await database.connect()
+    idempotency = IdempotencyStore(database.pool)
     llm_client = get_llm_client(purpose="summary")
 
     log.info(
@@ -214,6 +337,7 @@ async def run() -> None:
             "queue": QUEUE_COMMITS,
             "publishes_to": QUEUE_FINDINGS,
             "llm_provider": llm_client.provider,
+            "prefetch_count": broker.prefetch_count,
         },
     )
 
@@ -222,6 +346,7 @@ async def run() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop_event.set)
 
+    fatal_error: BaseException | None = None
     async with queue.iterator() as queue_iter:
         consume_task = asyncio.create_task(
             _consume(
@@ -229,15 +354,43 @@ async def run() -> None:
                 broker=broker,
                 repo_cache=repo_cache,
                 database=database,
+                retry_ladder=retry_ladder,
+                idempotency=idempotency,
                 llm_client=llm_client,
             )
         )
-        await stop_event.wait()
-        consume_task.cancel()
+        stop_wait_task = asyncio.create_task(stop_event.wait())
+        done, _pending = await asyncio.wait(
+            {consume_task, stop_wait_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+
+        if consume_task in done and consume_task.exception() is not None:
+            fatal_error = consume_task.exception()
+        else:
+            # SIGTERM/SIGINT: stop accepting new work, then give any
+            # message currently being handled a bounded window to finish
+            # naturally (ack/nack + any in-flight publish) rather than
+            # cutting it off mid-processing.
+            log.info(
+                "shutdown signal received, draining in-flight work",
+                extra={"grace_period_seconds": GRACEFUL_SHUTDOWN_SECONDS},
+            )
+            try:
+                await asyncio.wait_for(consume_task, timeout=GRACEFUL_SHUTDOWN_SECONDS)
+            except asyncio.TimeoutError:
+                log.warning("graceful shutdown window elapsed, cancelling consumer")
+                consume_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await consume_task
+            except Exception as exc:  # pragma: no cover - defensive
+                fatal_error = exc
+        stop_wait_task.cancel()
 
     await database.close()
     await broker.close()
     log.info("researcher stopped")
+    if fatal_error is not None:
+        raise fatal_error
 
 
 async def _consume(
@@ -246,6 +399,8 @@ async def _consume(
     broker: Broker,
     repo_cache: RepositoryCache,
     database: Database,
+    retry_ladder: RetryLadder,
+    idempotency: IdempotencyStore,
     llm_client: LLMClient | None = None,
 ) -> None:
     async for message in queue_iter:
@@ -254,12 +409,18 @@ async def _consume(
             broker=broker,
             repo_cache=repo_cache,
             database=database,
+            retry_ladder=retry_ladder,
+            idempotency=idempotency,
             llm_client=llm_client,
         )
 
 
 def main() -> None:
-    asyncio.run(run())
+    try:
+        asyncio.run(run())
+    except FatalError as exc:
+        log.critical("researcher stopped due to fatal error", extra={"reason": str(exc)})
+        raise SystemExit(1) from exc
 
 
 if __name__ == "__main__":

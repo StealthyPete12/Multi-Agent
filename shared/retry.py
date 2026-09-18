@@ -274,3 +274,38 @@ class RetryLadder:
                 "original_queue": original_queue,
             },
         )
+
+    async def send_raw_to_dlq(
+        self,
+        raw_body: bytes,
+        *,
+        reason: str,
+        original_queue: str,
+        content_type: str = "application/json",
+    ) -> None:
+        """Like :meth:`send_to_dlq`, for a message that isn't a valid
+        :class:`~shared.contracts.Envelope` in the first place (contract
+        validation failure) — the true original bytes are preserved
+        as-is for inspection/replay rather than being reconstructed into
+        a synthetic envelope, which would lose the actual poison payload.
+        """
+        message = aio_pika.Message(
+            body=raw_body,
+            content_type=content_type,
+            delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+            headers={
+                HEADER_ATTEMPT: 0,
+                HEADER_REASON: reason[:500],
+                HEADER_ORIGINAL_QUEUE: original_queue,
+                HEADER_FIRST_FAILED_AT: datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        await self.broker.channel.default_exchange.publish(message, routing_key=DLQ_QUEUE_NAME)
+        log.error(
+            "poison message routed to DLQ",
+            extra={
+                "dlq_routing": DLQ_QUEUE_NAME,
+                "reason": reason,
+                "original_queue": original_queue,
+            },
+        )
