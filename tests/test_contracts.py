@@ -77,8 +77,11 @@ def test_findings_ready_round_trip_via_parse_envelope():
 def test_review_completed_round_trip():
     payload = ReviewCompleted(
         commit_sha="a" * 40,
+        repo="acme/widgets",
         report_id="rep-1",
         status="needs_review",
+        severity="high",
+        score=7,
         summary="1 high severity finding",
         total_findings=1,
         completed_at=_now(),

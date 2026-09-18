@@ -131,15 +131,24 @@ class FindingsReady(ContractModel):
 
 
 class ReviewCompleted(ContractModel):
-    """Published by the aggregator once every expected agent has reported
-    findings for a commit and a final report has been generated."""
+    """Published by the reviewer once a commit's findings have been scored,
+    narrated, persisted, and (if configured) posted to Slack.
+
+    ``severity``/``score`` are the deterministic risk-scoring output from
+    ``agents/reviewer/scoring.py`` — never LLM-influenced (see that
+    module's docstring). ``status`` is a pure function of ``severity``
+    (``agents/reviewer/scoring.py::status_for_severity``).
+    """
 
     SCHEMA_VERSION: ClassVar[str] = "1.0"
 
     schema_version: Literal["1.0"] = "1.0"
     commit_sha: str
+    repo: str
     report_id: str
     status: Literal["passed", "failed", "needs_review"]
+    severity: Literal["low", "moderate", "high", "critical"]
+    score: int = Field(ge=0)
     summary: str
     total_findings: int = Field(ge=0)
     completed_at: datetime
