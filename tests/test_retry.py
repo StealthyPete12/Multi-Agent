@@ -136,19 +136,29 @@ async def test_send_to_dlq(rabbitmq_available):
         original_queue="q.commits",
     )
 
+    # q.dlq is real, shared production infrastructure — a live agent may
+    # have parked genuine poison messages there. Drain everything into
+    # memory first (get() until empty) rather than iterating+auto-acking
+    # (which would silently destroy anything already in it, and which a
+    # requeue-while-iterating loop could also livelock on); then ack only
+    # our own message and nack-with-requeue every other one back in,
+    # unchanged — the same drain/restore pattern tools/replay_dlq.py uses.
     received = None
-
-    async def consume():
-        nonlocal received
-        async with dlq.iterator() as it:
-            async for message in it:
-                async with message.process():
-                    if message.body == envelope.to_bytes():
-                        received = message
-                        return
-
+    others = []
     try:
-        await asyncio.wait_for(consume(), timeout=5)
+        while True:
+            message = await dlq.get(no_ack=False, fail=False)
+            if message is None:
+                break
+            if received is None and message.body == envelope.to_bytes():
+                received = message
+            else:
+                others.append(message)
+
+        if received is not None:
+            await received.ack()
+        for message in others:
+            await message.nack(requeue=True)
     finally:
         await broker.close()
 
