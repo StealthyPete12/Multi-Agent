@@ -67,9 +67,18 @@ class ReviewStorage:
     async def is_processed(self, event_id: str) -> bool:
         """True if ``event_id`` (the findings.ready event) has already
         been fully processed into a report — an at-least-once redelivery
-        of the same event should no-op rather than duplicate a report."""
+        of the same event should no-op rather than duplicate a report.
+
+        Checks ``completed_at IS NOT NULL`` (not mere row existence):
+        since Phase 4, ``shared/idempotency.py::IdempotencyStore.claim()``
+        inserts a row *before* any work starts (see
+        ``db/migrations/003_idempotency_claims.sql``), so a row can exist
+        for an event that's claimed but not yet actually processed — that
+        must not be mistaken for "done" here.
+        """
         row = await self.pool.fetchrow(
-            "SELECT 1 FROM processed_events WHERE event_id = $1", event_id
+            "SELECT 1 FROM processed_events WHERE event_id = $1 AND completed_at IS NOT NULL",
+            event_id,
         )
         return row is not None
 
@@ -133,11 +142,16 @@ class ReviewStorage:
                     json.dumps(findings.sensitive_hits),
                     event_id,
                 )
+                # ON CONFLICT DO UPDATE (not DO NOTHING): Phase 4's outer
+                # claim (shared/idempotency.py) already inserted this row
+                # with completed_at NULL before process_findings() ran —
+                # this is what actually marks it complete, atomically with
+                # the report row, in the same transaction.
                 await conn.execute(
                     """
-                    INSERT INTO processed_events (event_id, event_type, trace_id)
-                    VALUES ($1, $2, $3)
-                    ON CONFLICT (event_id) DO NOTHING
+                    INSERT INTO processed_events (event_id, event_type, trace_id, completed_at)
+                    VALUES ($1, $2, $3, now())
+                    ON CONFLICT (event_id) DO UPDATE SET completed_at = now()
                     """,
                     event_id,
                     "findings.ready",
