@@ -28,6 +28,7 @@ import time
 from datetime import datetime, timezone
 
 import asyncpg
+from opentelemetry.trace import SpanKind
 from pydantic import ValidationError
 
 from agents.researcher.db import Database
@@ -37,6 +38,7 @@ from agents.researcher.impact import DEFAULT_MAX_DEPTH, changed_files_to_modules
 from agents.researcher.repository import CommitNotFoundError, GitCommandError, RepositoryCache
 from agents.researcher.sensitive import detect_sensitive_hits
 from agents.researcher.summarize import generate_semantic_summary
+from shared import telemetry
 from shared.broker import Broker
 from shared.contracts import (
     BlastRadius,
@@ -55,6 +57,7 @@ from shared.retry import MAX_RETRY_ATTEMPTS, RetryLadder
 QUEUE_COMMITS = os.environ.get("QUEUE_COMMITS", "q.commits")
 QUEUE_FINDINGS = os.environ.get("QUEUE_FINDINGS", "q.findings")
 BLAST_RADIUS_MAX_DEPTH = int(os.environ.get("BLAST_RADIUS_MAX_DEPTH", DEFAULT_MAX_DEPTH))
+RESEARCHER_METRICS_PORT = int(os.environ.get("RESEARCHER_METRICS_PORT", "9102"))
 
 log = configure_logging(service_name="researcher")
 
@@ -106,18 +109,29 @@ async def analyze_commit(
             "repo": payload.repo,
             "commit_sha": payload.commit_sha,
             "duration_ms": (time.monotonic() - t0) * 1000,
+            "event_type": "repository.ensure",
         },
     )
 
     t0 = time.monotonic()
-    graph = build_dependency_graph(repo_path)
+    with telemetry.span(
+        "researcher.graph_build",
+        kind=SpanKind.INTERNAL,
+        tracer_name="agents.researcher",
+        attributes={"swarm.repo": payload.repo},
+    ) as graph_span:
+        graph = build_dependency_graph(repo_path)
+        duration_ms = (time.monotonic() - t0) * 1000
+        graph_span.set_attribute("swarm.modules", len(graph.modules))
+        graph_span.set_attribute("swarm.edges", len(graph.edges))
     log.info(
         "dependency graph built",
         extra={
             "repo": payload.repo,
             "modules": len(graph.modules),
             "edges": len(graph.edges),
-            "duration_ms": (time.monotonic() - t0) * 1000,
+            "duration_ms": duration_ms,
+            "event_type": "researcher.graph_build",
         },
     )
 
@@ -146,6 +160,7 @@ async def analyze_commit(
             "commit_sha": payload.commit_sha,
             "summary_length": len(semantic_summary),
             "duration_ms": (time.monotonic() - t0) * 1000,
+            "event_type": "researcher.semantic_summary",
         },
     )
 
@@ -211,7 +226,20 @@ async def handle_message(
 
     attempt = RetryLadder.attempt_from_headers(message.headers)
 
-    with trace_context(trace_id=envelope.trace_id, correlation_id=envelope.event_id):
+    with trace_context(trace_id=envelope.trace_id, correlation_id=envelope.event_id), telemetry.consumer_span(
+        "researcher.handle_commit_detected",
+        message.headers,
+        tracer_name="agents.researcher",
+        attributes={
+            "messaging.system": "rabbitmq",
+            "messaging.destination.name": QUEUE_COMMITS,
+            "swarm.repo": envelope.payload.repo,
+            "swarm.commit_sha": envelope.payload.commit_sha,
+            "swarm.retry_count": attempt,
+        },
+    ):
+        telemetry.get_metrics().events_processed.add(1, {"event_type": "commit.detected", "direction": "consumed"})
+        telemetry.get_metrics().commit_events.add(1, {"repo": envelope.payload.repo, "direction": "consumed"})
         log.info(
             "commit.detected received",
             extra={
@@ -221,6 +249,7 @@ async def handle_message(
                 "branch": envelope.payload.branch,
                 "changed_files": envelope.payload.changed_files,
                 "retry_count": attempt,
+                "event_type": "commit.detected",
             },
         )
 
@@ -249,6 +278,7 @@ async def handle_message(
                 correlation_id=envelope.event_id,
             )
             await broker.publish(findings_envelope, routing_key=EventType.FINDINGS_READY.value)
+            telemetry.get_metrics().findings_events.add(1, {"repo": findings_payload.repo, "direction": "published"})
             log.info(
                 "published findings.ready",
                 extra={
@@ -256,6 +286,7 @@ async def handle_message(
                     "commit_sha": findings_payload.commit_sha,
                     "impact_count": findings_payload.blast_radius.impact_count,
                     "sensitive_hits": len(findings_payload.sensitive_hits),
+                    "event_type": "findings.ready",
                 },
             )
             await idempotency.mark_complete(envelope.event_id)
@@ -309,6 +340,7 @@ GRACEFUL_SHUTDOWN_SECONDS = float(os.environ.get("GRACEFUL_SHUTDOWN_SECONDS", "3
 
 
 async def run() -> None:
+    telemetry.init_telemetry("researcher", metrics_port=RESEARCHER_METRICS_PORT)
     # prefetch_count=1: at most one unacked commit.detected in flight at a
     # time, so manual ack/nack below always reflects exactly the message
     # currently being handled — no risk of acking/nacking the wrong one,
@@ -389,6 +421,7 @@ async def run() -> None:
 
     await database.close()
     await broker.close()
+    telemetry.shutdown_telemetry()
     log.info("researcher stopped")
     if fatal_error is not None:
         raise fatal_error

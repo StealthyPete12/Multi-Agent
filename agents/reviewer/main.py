@@ -29,6 +29,7 @@ import time
 from datetime import datetime, timezone
 
 import asyncpg
+from opentelemetry.trace import SpanKind
 from pydantic import ValidationError
 
 from agents.reviewer.prompts import (
@@ -39,6 +40,7 @@ from agents.reviewer.prompts import (
 )
 from agents.reviewer.scoring import ScoreBreakdown, compute_score, status_for_severity
 from agents.reviewer.storage import ReviewStorage
+from shared import telemetry
 from shared.broker import Broker
 from shared.contracts import Envelope, EventType, FindingsReady, ReviewCompleted, make_envelope
 from shared.errors import FatalError, PoisonMessageError, RetryableError, classify_exception
@@ -50,6 +52,7 @@ from shared.slack import SlackError, SlackNotifier, build_review_message
 
 QUEUE_FINDINGS = os.environ.get("QUEUE_FINDINGS", "q.findings")
 QUEUE_REVIEWS = os.environ.get("QUEUE_REVIEWS", "q.reviews")
+REVIEWER_METRICS_PORT = int(os.environ.get("REVIEWER_METRICS_PORT", "9103"))
 
 log = configure_logging(service_name="reviewer")
 
@@ -113,65 +116,83 @@ async def process_findings(
         log.info("findings.ready already processed, skipping", extra={"event_id": event_id})
         return None
 
-    t0 = time.monotonic()
-    breakdown = compute_score(findings)
-    log.info(
-        "risk score computed",
-        extra={
-            "repo": findings.repo,
-            "commit_sha": findings.commit_sha,
-            "severity": breakdown.severity,
-            "score": breakdown.total,
-            "duration_ms": (time.monotonic() - t0) * 1000,
-        },
-    )
+    review_started = time.monotonic()
+    with telemetry.span(
+        "reviewer.review_generation",
+        kind=SpanKind.INTERNAL,
+        tracer_name="agents.reviewer",
+        attributes={"swarm.repo": findings.repo, "swarm.commit_sha": findings.commit_sha},
+    ):
+        t0 = time.monotonic()
+        breakdown = compute_score(findings)
+        log.info(
+            "risk score computed",
+            extra={
+                "repo": findings.repo,
+                "commit_sha": findings.commit_sha,
+                "severity": breakdown.severity,
+                "score": breakdown.total,
+                "duration_ms": (time.monotonic() - t0) * 1000,
+                "event_type": "reviewer.risk_score",
+            },
+        )
 
-    t0 = time.monotonic()
-    narrative = await generate_narrative(findings, breakdown, llm_client=llm_client)
-    log.info(
-        "review narrative generated",
-        extra={
-            "repo": findings.repo,
-            "commit_sha": findings.commit_sha,
-            "narrative_length": len(narrative),
-            "duration_ms": (time.monotonic() - t0) * 1000,
-        },
-    )
+        t0 = time.monotonic()
+        narrative = await generate_narrative(findings, breakdown, llm_client=llm_client)
+        log.info(
+            "review narrative generated",
+            extra={
+                "repo": findings.repo,
+                "commit_sha": findings.commit_sha,
+                "narrative_length": len(narrative),
+                "duration_ms": (time.monotonic() - t0) * 1000,
+                "event_type": "reviewer.narrative",
+            },
+        )
 
-    status = status_for_severity(breakdown.severity)
+        status = status_for_severity(breakdown.severity)
 
-    t0 = time.monotonic()
-    saved = await storage.save_report(
-        findings,
-        event_id=event_id,
-        trace_id=trace_id,
-        breakdown=breakdown,
-        status=status,
-        narrative=narrative,
-    )
-    log.info(
-        "database write complete",
-        extra={"report_id": saved.report_id, "duration_ms": (time.monotonic() - t0) * 1000},
-    )
+        t0 = time.monotonic()
+        saved = await storage.save_report(
+            findings,
+            event_id=event_id,
+            trace_id=trace_id,
+            breakdown=breakdown,
+            status=status,
+            narrative=narrative,
+        )
+        log.info(
+            "database write complete",
+            extra={
+                "report_id": saved.report_id,
+                "duration_ms": (time.monotonic() - t0) * 1000,
+                "event_type": "database.write",
+            },
+        )
 
-    t0 = time.monotonic()
-    message = build_review_message(
-        repo=findings.repo,
-        commit_sha=findings.commit_sha,
-        severity=breakdown.severity,
-        score=breakdown.total,
-        blast_radius_impact_count=findings.blast_radius.impact_count,
-        blast_radius_max_depth=findings.blast_radius.max_depth,
-        sensitive_hits=findings.sensitive_hits,
-        narrative=narrative,
-    )
-    await slack.send(message)
-    log.info(
-        "slack delivery complete",
-        extra={
-            "configured": slack.is_configured,
-            "duration_ms": (time.monotonic() - t0) * 1000,
-        },
+        t0 = time.monotonic()
+        message = build_review_message(
+            repo=findings.repo,
+            commit_sha=findings.commit_sha,
+            severity=breakdown.severity,
+            score=breakdown.total,
+            blast_radius_impact_count=findings.blast_radius.impact_count,
+            blast_radius_max_depth=findings.blast_radius.max_depth,
+            sensitive_hits=findings.sensitive_hits,
+            narrative=narrative,
+        )
+        await slack.send(message)
+        log.info(
+            "slack delivery complete",
+            extra={
+                "configured": slack.is_configured,
+                "duration_ms": (time.monotonic() - t0) * 1000,
+                "event_type": "slack.deliver",
+            },
+        )
+
+    telemetry.get_metrics().review_duration_ms.record(
+        (time.monotonic() - review_started) * 1000, {"repo": findings.repo, "severity": breakdown.severity}
     )
 
     return ReviewCompleted(
@@ -222,7 +243,20 @@ async def handle_message(
 
     attempt = RetryLadder.attempt_from_headers(message.headers)
 
-    with trace_context(trace_id=envelope.trace_id, correlation_id=envelope.event_id):
+    with trace_context(trace_id=envelope.trace_id, correlation_id=envelope.event_id), telemetry.consumer_span(
+        "reviewer.handle_findings_ready",
+        message.headers,
+        tracer_name="agents.reviewer",
+        attributes={
+            "messaging.system": "rabbitmq",
+            "messaging.destination.name": QUEUE_FINDINGS,
+            "swarm.repo": envelope.payload.repo,
+            "swarm.commit_sha": envelope.payload.commit_sha,
+            "swarm.retry_count": attempt,
+        },
+    ):
+        telemetry.get_metrics().events_processed.add(1, {"event_type": "findings.ready", "direction": "consumed"})
+        telemetry.get_metrics().findings_events.add(1, {"repo": envelope.payload.repo, "direction": "consumed"})
         log.info(
             "findings.ready received",
             extra={
@@ -232,6 +266,7 @@ async def handle_message(
                 "impact_count": envelope.payload.blast_radius.impact_count,
                 "sensitive_hits": len(envelope.payload.sensitive_hits),
                 "retry_count": attempt,
+                "event_type": "findings.ready",
             },
         )
 
@@ -273,6 +308,7 @@ async def handle_message(
                 correlation_id=envelope.event_id,
             )
             await broker.publish(review_envelope, routing_key=EventType.REVIEW_COMPLETED.value)
+            telemetry.get_metrics().review_events.add(1, {"repo": review.repo, "severity": review.severity, "direction": "published"})
             log.info(
                 "published review.completed",
                 extra={
@@ -281,6 +317,7 @@ async def handle_message(
                     "severity": review.severity,
                     "score": review.score,
                     "report_id": review.report_id,
+                    "event_type": "review.completed",
                 },
             )
             await idempotency.mark_complete(envelope.event_id)
@@ -326,6 +363,7 @@ GRACEFUL_SHUTDOWN_SECONDS = float(os.environ.get("GRACEFUL_SHUTDOWN_SECONDS", "3
 
 
 async def run() -> None:
+    telemetry.init_telemetry("reviewer", metrics_port=REVIEWER_METRICS_PORT)
     # prefetch_count=1: see agents/researcher/main.py::run for the same
     # rationale — exactly one unacked findings.ready in flight at a time.
     broker = Broker(prefetch_count=1)
@@ -400,6 +438,7 @@ async def run() -> None:
 
     await storage.close()
     await broker.close()
+    telemetry.shutdown_telemetry()
     log.info("reviewer stopped")
     if fatal_error is not None:
         raise fatal_error

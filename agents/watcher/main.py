@@ -26,7 +26,10 @@ from datetime import datetime
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Request, Response
+from opentelemetry.trace import SpanKind
+from prometheus_client import make_asgi_app
 
+from shared import telemetry
 from shared.broker import Broker
 from shared.contracts import CommitDetected, EventType, make_envelope
 from shared.logging import configure_logging, trace_context
@@ -108,6 +111,7 @@ def extract_commit_events(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    telemetry.init_telemetry("watcher", start_metrics_server=False)
     broker = Broker()
     await broker.connect()
     await broker.declare_queue(
@@ -122,9 +126,13 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         await broker.close()
+        telemetry.shutdown_telemetry()
 
 
 app = FastAPI(title="watcher", lifespan=lifespan)
+# Prometheus scrapes this directly (mounted on the watcher's own FastAPI
+# app rather than a second HTTP server, since one's already running here).
+app.mount("/metrics", make_asgi_app())
 
 
 @app.get("/healthz")
@@ -161,7 +169,17 @@ async def github_webhook(
     trace_id = str(uuid.uuid4())
     compare_url = payload.get("compare")
 
-    with trace_context(trace_id=trace_id):
+    with trace_context(trace_id=trace_id), telemetry.span(
+        "watcher.webhook_received",
+        kind=SpanKind.SERVER,
+        tracer_name="agents.watcher",
+        attributes={
+            "http.method": "POST",
+            "http.route": "/webhook/github",
+            "swarm.branch": branch,
+            "swarm.trace_id": trace_id,
+        },
+    ):
         commit_events = extract_commit_events(payload, trace_id=trace_id)
 
         broker: Broker = request.app.state.broker
@@ -175,6 +193,7 @@ async def github_webhook(
             )
             await broker.publish(envelope, routing_key=EventType.COMMIT_DETECTED.value)
             published.append(envelope.event_id)
+            telemetry.get_metrics().commit_events.add(1, {"repo": commit_payload.repo, "direction": "published"})
             log.info(
                 "published commit.detected",
                 extra={
@@ -183,6 +202,7 @@ async def github_webhook(
                     "commit_sha": commit_payload.commit_sha,
                     "branch": commit_payload.branch,
                     "compare_url": compare_url,
+                    "event_type": "commit.detected",
                 },
             )
 

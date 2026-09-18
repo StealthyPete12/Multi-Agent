@@ -16,6 +16,9 @@ import os
 import time
 from pathlib import Path
 
+from opentelemetry.trace import SpanKind
+
+from shared import telemetry
 from shared.logging import configure_logging
 
 __all__ = ["RepositoryCache", "GitCommandError", "CommitNotFoundError"]
@@ -88,27 +91,34 @@ class RepositoryCache:
         path = self.local_path(repo)
         url = clone_url or self.clone_url(repo)
 
-        if self.is_cached(repo):
-            log.info("repository cache hit", extra={"repo": repo, "path": str(path)})
-            if self.is_stale(repo):
-                log.info("repository cache stale, refreshing", extra={"repo": repo})
-                await self._fetch(path)
-        else:
-            log.info("repository cache miss, cloning", extra={"repo": repo, "url": url})
-            await self._clone(url, path)
+        with telemetry.span(
+            "repository.ensure",
+            kind=SpanKind.INTERNAL,
+            tracer_name="agents.researcher",
+            attributes={"swarm.repo": repo, "swarm.commit_sha": commit_sha},
+        ):
+            if self.is_cached(repo):
+                log.info("repository cache hit", extra={"repo": repo, "path": str(path), "event_type": "repository.cache_hit"})
+                telemetry.get_metrics().repo_cache_hits.add(1, {"repo": repo})
+                if self.is_stale(repo):
+                    log.info("repository cache stale, refreshing", extra={"repo": repo, "event_type": "repository.refresh"})
+                    await self._fetch(path)
+            else:
+                log.info("repository cache miss, cloning", extra={"repo": repo, "url": url, "event_type": "repository.cache_miss"})
+                await self._clone(url, path)
 
-        try:
-            await self._checkout(path, commit_sha)
-        except CommitNotFoundError:
-            log.info(
-                "commit not in local history, unshallowing",
-                extra={"repo": repo, "commit_sha": commit_sha},
-            )
-            await self._fetch(path, unshallow=True)
-            await self._checkout(path, commit_sha)
+            try:
+                await self._checkout(path, commit_sha)
+            except CommitNotFoundError:
+                log.info(
+                    "commit not in local history, unshallowing",
+                    extra={"repo": repo, "commit_sha": commit_sha, "event_type": "repository.unshallow"},
+                )
+                await self._fetch(path, unshallow=True)
+                await self._checkout(path, commit_sha)
 
-        self._touch(path)
-        return path
+            self._touch(path)
+            return path
 
     async def _run_git(self, *args: str, cwd: Path | None = None) -> tuple[int, str, str]:
         import asyncio
@@ -126,34 +136,59 @@ class RepositoryCache:
         )
 
     async def _clone(self, url: str, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        started = time.monotonic()
-        code, _, stderr = await self._run_git("clone", "--depth", "1", url, str(path))
-        duration_ms = (time.monotonic() - started) * 1000
-        if code != 0:
-            raise GitCommandError(f"git clone failed for {url}: {stderr.strip()}")
-        log.info(
-            "repository cloned",
-            extra={"url": url, "path": str(path), "duration_ms": duration_ms, "shallow": True},
-        )
+        with telemetry.span(
+            "repository.clone", kind=SpanKind.INTERNAL, tracer_name="agents.researcher", attributes={"swarm.url": url}
+        ) as current_span:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            started = time.monotonic()
+            code, _, stderr = await self._run_git("clone", "--depth", "1", url, str(path))
+            duration_ms = (time.monotonic() - started) * 1000
+            current_span.set_attribute("swarm.duration_ms", duration_ms)
+            if code != 0:
+                raise GitCommandError(f"git clone failed for {url}: {stderr.strip()}")
+            log.info(
+                "repository cloned",
+                extra={
+                    "url": url,
+                    "path": str(path),
+                    "duration_ms": duration_ms,
+                    "shallow": True,
+                    "event_type": "repository.clone",
+                },
+            )
+            telemetry.get_metrics().repo_clones.add(1, {"url": url})
+            telemetry.get_metrics().repo_clone_duration_ms.record(duration_ms, {"url": url})
 
     async def _fetch(self, path: Path, *, unshallow: bool = False) -> None:
-        started = time.monotonic()
-        args = ["fetch", "origin"]
-        if unshallow:
-            args.append("--unshallow")
-        code, _, stderr = await self._run_git(*args, cwd=path)
-        duration_ms = (time.monotonic() - started) * 1000
-        if code != 0 and unshallow and "already a complete repository" in stderr:
-            # Already fully fetched (e.g. a non-shallow test fixture repo);
-            # not an error.
-            code = 0
-        if code != 0:
-            raise GitCommandError(f"git fetch failed for {path}: {stderr.strip()}")
-        log.info(
-            "repository fetched",
-            extra={"path": str(path), "duration_ms": duration_ms, "unshallow": unshallow},
-        )
+        with telemetry.span(
+            "repository.refresh",
+            kind=SpanKind.INTERNAL,
+            tracer_name="agents.researcher",
+            attributes={"swarm.path": str(path), "swarm.unshallow": unshallow},
+        ) as current_span:
+            started = time.monotonic()
+            args = ["fetch", "origin"]
+            if unshallow:
+                args.append("--unshallow")
+            code, _, stderr = await self._run_git(*args, cwd=path)
+            duration_ms = (time.monotonic() - started) * 1000
+            current_span.set_attribute("swarm.duration_ms", duration_ms)
+            if code != 0 and unshallow and "already a complete repository" in stderr:
+                # Already fully fetched (e.g. a non-shallow test fixture repo);
+                # not an error.
+                code = 0
+            if code != 0:
+                raise GitCommandError(f"git fetch failed for {path}: {stderr.strip()}")
+            log.info(
+                "repository fetched",
+                extra={
+                    "path": str(path),
+                    "duration_ms": duration_ms,
+                    "unshallow": unshallow,
+                    "event_type": "repository.refresh",
+                },
+            )
+            telemetry.get_metrics().repo_refresh_duration_ms.record(duration_ms, {"unshallow": str(unshallow)})
 
     async def _checkout(self, path: Path, commit_sha: str) -> None:
         started = time.monotonic()

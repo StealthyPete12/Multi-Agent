@@ -21,8 +21,10 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 
 import asyncpg
+from opentelemetry.trace import SpanKind
 
 from agents.researcher.graph import DependencyGraph
+from shared import telemetry
 from shared.logging import configure_logging
 
 __all__ = ["Database", "BlastRadiusResult", "DEFAULT_DATABASE_URL"]
@@ -52,6 +54,7 @@ class Database:
         if self._pool is not None:
             return
         self._pool = await asyncpg.create_pool(self.dsn, min_size=1, max_size=5)
+        telemetry.register_pool_gauges("researcher", lambda: self._pool)
 
     async def close(self) -> None:
         if self._pool is not None:
@@ -105,30 +108,46 @@ class Database:
         """Persist every module and its import edges for ``repo`` inside
         one transaction, so a failure midway leaves the previous state
         intact rather than a half-written graph."""
-        started = time.monotonic()
-        edges_by_module: dict[str, list[tuple[str, str, int | None]]] = defaultdict(list)
-        for edge in graph.edges:
-            edges_by_module[edge.importer].append((edge.imported, edge.import_type, edge.line_number))
+        with telemetry.span(
+            "database.write",
+            kind=SpanKind.CLIENT,
+            tracer_name="agents.researcher",
+            attributes={"swarm.repo": repo, "db.operation": "store_graph"},
+        ) as current_span:
+            started = time.monotonic()
+            try:
+                edges_by_module: dict[str, list[tuple[str, str, int | None]]] = defaultdict(list)
+                for edge in graph.edges:
+                    edges_by_module[edge.importer].append(
+                        (edge.imported, edge.import_type, edge.line_number)
+                    )
 
-        module_ids: dict[str, str] = {}
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                for module in graph.modules.values():
-                    module_id = await self.upsert_module(conn, repo, module.path, module.name, "python")
-                    module_ids[module.name] = module_id
-                for module_name, module_id in module_ids.items():
-                    await self.replace_imports(conn, module_id, edges_by_module.get(module_name, []))
+                module_ids: dict[str, str] = {}
+                async with self.pool.acquire() as conn:
+                    async with conn.transaction():
+                        for module in graph.modules.values():
+                            module_id = await self.upsert_module(conn, repo, module.path, module.name, "python")
+                            module_ids[module.name] = module_id
+                        for module_name, module_id in module_ids.items():
+                            await self.replace_imports(conn, module_id, edges_by_module.get(module_name, []))
+            except Exception:
+                telemetry.get_metrics().db_failures.add(1, {"operation": "store_graph"})
+                raise
 
-        log.info(
-            "graph persisted",
-            extra={
-                "repo": repo,
-                "modules": len(module_ids),
-                "edges": len(graph.edges),
-                "duration_ms": (time.monotonic() - started) * 1000,
-            },
-        )
-        return module_ids
+            duration_ms = (time.monotonic() - started) * 1000
+            current_span.set_attribute("swarm.duration_ms", duration_ms)
+            telemetry.get_metrics().db_write_duration_ms.record(duration_ms, {"table": "modules", "operation": "store_graph"})
+            log.info(
+                "graph persisted",
+                extra={
+                    "repo": repo,
+                    "modules": len(module_ids),
+                    "edges": len(graph.edges),
+                    "duration_ms": duration_ms,
+                    "event_type": "database.write",
+                },
+            )
+            return module_ids
 
     async def blast_radius(
         self, repo: str, changed_module_names: list[str], *, max_depth: int
@@ -156,19 +175,34 @@ class Database:
             GROUP BY name
             ORDER BY name
         """
-        started = time.monotonic()
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch(query, repo, changed, max_depth)
-        log.info(
-            "blast radius queried",
-            extra={
-                "repo": repo,
-                "changed_modules": len(changed),
-                "max_depth": max_depth,
-                "impact_count": len(rows),
-                "duration_ms": (time.monotonic() - started) * 1000,
-            },
-        )
+        with telemetry.span(
+            "researcher.blast_radius_analysis",
+            kind=SpanKind.CLIENT,
+            tracer_name="agents.researcher",
+            attributes={"swarm.repo": repo, "swarm.max_depth": max_depth},
+        ) as current_span:
+            started = time.monotonic()
+            try:
+                async with self.pool.acquire() as conn:
+                    rows = await conn.fetch(query, repo, changed, max_depth)
+            except Exception:
+                telemetry.get_metrics().db_failures.add(1, {"operation": "blast_radius"})
+                raise
+            duration_ms = (time.monotonic() - started) * 1000
+            current_span.set_attribute("swarm.duration_ms", duration_ms)
+            current_span.set_attribute("swarm.impact_count", len(rows))
+            telemetry.get_metrics().blast_radius_duration_ms.record(duration_ms, {"repo": repo})
+            log.info(
+                "blast radius queried",
+                extra={
+                    "repo": repo,
+                    "changed_modules": len(changed),
+                    "max_depth": max_depth,
+                    "impact_count": len(rows),
+                    "duration_ms": duration_ms,
+                    "event_type": "researcher.blast_radius_analysis",
+                },
+            )
 
         chains = {row["name"]: row["depth"] for row in rows}
         impacted = sorted(chains)

@@ -22,8 +22,10 @@ import time
 from dataclasses import dataclass
 
 import asyncpg
+from opentelemetry.trace import SpanKind
 
 from agents.reviewer.scoring import ScoreBreakdown, Severity
+from shared import telemetry
 from shared.contracts import FindingsReady
 from shared.logging import configure_logging
 
@@ -52,6 +54,7 @@ class ReviewStorage:
         if self._pool is not None:
             return
         self._pool = await asyncpg.create_pool(self.dsn, min_size=1, max_size=5)
+        telemetry.register_pool_gauges("reviewer", lambda: self._pool)
 
     async def close(self) -> None:
         if self._pool is not None:
@@ -95,81 +98,96 @@ class ReviewStorage:
         """Persist one review report and mark ``event_id`` processed, in a
         single transaction so a crash between the two never leaves an
         unmarked report that would be reprocessed as a duplicate."""
-        started = time.monotonic()
-        score_breakdown_json = json.dumps(
-            {
-                "blast_radius_points": breakdown.blast_radius_points,
-                "impact_count_points": breakdown.impact_count_points,
-                "sensitive_hits_points": breakdown.sensitive_hits_points,
-                "changed_files_points": breakdown.changed_files_points,
-                "test_proximity_points": breakdown.test_proximity_points,
-            }
-        )
-        blast_radius_json = json.dumps(
-            {
-                "impacted_modules": findings.blast_radius.impacted_modules,
-                "impact_count": findings.blast_radius.impact_count,
-                "max_depth": findings.blast_radius.max_depth,
-            }
-        )
+        with telemetry.span(
+            "database.write",
+            kind=SpanKind.CLIENT,
+            tracer_name="agents.reviewer",
+            attributes={"swarm.repo": findings.repo, "db.operation": "save_report"},
+        ) as current_span:
+            started = time.monotonic()
+            score_breakdown_json = json.dumps(
+                {
+                    "blast_radius_points": breakdown.blast_radius_points,
+                    "impact_count_points": breakdown.impact_count_points,
+                    "sensitive_hits_points": breakdown.sensitive_hits_points,
+                    "changed_files_points": breakdown.changed_files_points,
+                    "test_proximity_points": breakdown.test_proximity_points,
+                }
+            )
+            blast_radius_json = json.dumps(
+                {
+                    "impacted_modules": findings.blast_radius.impacted_modules,
+                    "impact_count": findings.blast_radius.impact_count,
+                    "max_depth": findings.blast_radius.max_depth,
+                }
+            )
 
-        async with self.pool.acquire() as conn:
-            async with conn.transaction():
-                row = await conn.fetchrow(
-                    """
-                    INSERT INTO reports (
-                        commit_id, status, summary, findings_count, report_data,
-                        repo, commit_sha, severity, score, score_breakdown,
-                        narrative, blast_radius, sensitive_hits, source_event_id
-                    )
-                    VALUES (
-                        NULL, $1, $2, $3, '{}'::jsonb,
-                        $4, $5, $6, $7, $8::jsonb,
-                        $9, $10::jsonb, $11::jsonb, $12
-                    )
-                    RETURNING id
-                    """,
-                    status,
-                    findings.semantic_summary,
-                    len(findings.findings),
-                    findings.repo,
-                    findings.commit_sha,
-                    breakdown.severity,
-                    breakdown.total,
-                    score_breakdown_json,
-                    narrative,
-                    blast_radius_json,
-                    json.dumps(findings.sensitive_hits),
-                    event_id,
-                )
-                # ON CONFLICT DO UPDATE (not DO NOTHING): Phase 4's outer
-                # claim (shared/idempotency.py) already inserted this row
-                # with completed_at NULL before process_findings() ran —
-                # this is what actually marks it complete, atomically with
-                # the report row, in the same transaction.
-                await conn.execute(
-                    """
-                    INSERT INTO processed_events (event_id, event_type, trace_id, completed_at)
-                    VALUES ($1, $2, $3, now())
-                    ON CONFLICT (event_id) DO UPDATE SET completed_at = now()
-                    """,
-                    event_id,
-                    "findings.ready",
-                    trace_id,
-                )
+            try:
+                async with self.pool.acquire() as conn:
+                    async with conn.transaction():
+                        row = await conn.fetchrow(
+                            """
+                            INSERT INTO reports (
+                                commit_id, status, summary, findings_count, report_data,
+                                repo, commit_sha, severity, score, score_breakdown,
+                                narrative, blast_radius, sensitive_hits, source_event_id
+                            )
+                            VALUES (
+                                NULL, $1, $2, $3, '{}'::jsonb,
+                                $4, $5, $6, $7, $8::jsonb,
+                                $9, $10::jsonb, $11::jsonb, $12
+                            )
+                            RETURNING id
+                            """,
+                            status,
+                            findings.semantic_summary,
+                            len(findings.findings),
+                            findings.repo,
+                            findings.commit_sha,
+                            breakdown.severity,
+                            breakdown.total,
+                            score_breakdown_json,
+                            narrative,
+                            blast_radius_json,
+                            json.dumps(findings.sensitive_hits),
+                            event_id,
+                        )
+                        # ON CONFLICT DO UPDATE (not DO NOTHING): Phase 4's outer
+                        # claim (shared/idempotency.py) already inserted this row
+                        # with completed_at NULL before process_findings() ran —
+                        # this is what actually marks it complete, atomically with
+                        # the report row, in the same transaction.
+                        await conn.execute(
+                            """
+                            INSERT INTO processed_events (event_id, event_type, trace_id, completed_at)
+                            VALUES ($1, $2, $3, now())
+                            ON CONFLICT (event_id) DO UPDATE SET completed_at = now()
+                            """,
+                            event_id,
+                            "findings.ready",
+                            trace_id,
+                        )
+            except Exception:
+                telemetry.get_metrics().db_failures.add(1, {"operation": "save_report"})
+                raise
 
-        log.info(
-            "report persisted",
-            extra={
-                "repo": findings.repo,
-                "commit_sha": findings.commit_sha,
-                "report_id": str(row["id"]),
-                "severity": breakdown.severity,
-                "score": breakdown.total,
-                "duration_ms": (time.monotonic() - started) * 1000,
-            },
-        )
-        return SavedReport(report_id=str(row["id"]), status=status)
+            duration_ms = (time.monotonic() - started) * 1000
+            current_span.set_attribute("swarm.duration_ms", duration_ms)
+            current_span.set_attribute("swarm.report_id", str(row["id"]))
+            telemetry.get_metrics().db_write_duration_ms.record(duration_ms, {"table": "reports", "operation": "save_report"})
+            log.info(
+                "report persisted",
+                extra={
+                    "repo": findings.repo,
+                    "commit_sha": findings.commit_sha,
+                    "report_id": str(row["id"]),
+                    "severity": breakdown.severity,
+                    "score": breakdown.total,
+                    "duration_ms": duration_ms,
+                    "event_type": "database.write",
+                },
+            )
+            return SavedReport(report_id=str(row["id"]), status=status)
 
     async def __aenter__(self) -> "ReviewStorage":
         await self.connect()
