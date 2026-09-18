@@ -22,6 +22,16 @@ This repo implements:
   a new reviewer agent that deterministically scores each commit's risk,
   asks an LLM only to *explain* that score, persists a report, and
   notifies Slack. See [`PHASE_3_REPORT.md`](PHASE_3_REPORT.md).
+- **Phase 4: fault tolerance** — a RabbitMQ delayed-retry ladder
+  (`shared/retry.py`), error classification (`shared/errors.py`),
+  claim-before-processing idempotency (`shared/idempotency.py`), a
+  Redis-backed rate limiter (`shared/ratelimit.py`) and circuit breaker
+  (`shared/breaker.py`) wired into every LLM call, manual-ack consumer
+  hygiene with graceful shutdown, and a DLQ inspection/replay tool
+  (`tools/replay_dlq.py`). No business logic changed — watcher, repo
+  cache, AST graph, blast radius, reviewer scoring, and Slack formatting
+  are exactly as Phase 3 left them. See
+  [`PHASE_4_REPORT.md`](PHASE_4_REPORT.md).
 
 ## Architecture
 
@@ -31,30 +41,47 @@ GitHub push
     ▼
 agents/watcher  ──────────────► RabbitMQ (swarm.events exchange)
 (FastAPI)          commit.detected         │
-                    routing key             │  q.commits (durable,
-                                             │  dead-letters to q.commits.dlq)
+                    routing key             │  q.commits (durable, prefetch=1,
+                                             │  manual ack; dead-letters to
+                                             │  q.commits.dlq on a raw nack)
                                              ▼
                                 agents/researcher (consumer)
+                                claim event_id (shared/idempotency.py) ->
                                 clone repo -> AST import graph -> Postgres
                                 (modules/imports) -> blast radius (recursive
                                 CTE) -> sensitive-path check -> semantic
-                                summary (small/cheap LLM, shared/llm.py)
+                                summary (small/cheap LLM, shared/llm.py,
+                                rate-limited + circuit-broken) -> mark
+                                complete
                                              │
-                                             │  findings.ready
+                             on failure: classify (shared/errors.py) ->
+                             RetryableError -> retry ladder (5s/30s/5m) ->
+                             PoisonMessageError -> q.dlq immediately ->
+                             FatalError -> log + stop the service
+                                             │
+                                             │  findings.ready (success path)
                                              ▼
-                                          q.findings (durable,
-                                          dead-letters to q.findings.dlq)
+                                          q.findings (durable, prefetch=1)
                                              │
                                              ▼
                                 agents/reviewer (consumer)
-                                deterministic risk score (scoring.py) ->
-                                LLM narrative (explains the score, never
-                                sets it) -> Postgres (reports) -> Slack
+                                claim event_id -> deterministic risk score
+                                (scoring.py, unchanged) -> LLM narrative
+                                (explains the score, never sets it) ->
+                                Postgres (reports) -> Slack -> mark complete
+                                             │
+                             same retry/DLQ/fatal routing as the researcher
                                              │
                                              │  review.completed
                                              ▼
-                                          q.reviews (durable,
-                                          dead-letters to q.reviews.dlq)
+                                          q.reviews (durable, prefetch=1)
+
+Retry ladder (shared/retry.py), shared by every consumer:
+
+  attempt 1 fails ──► q.retry.5s  ──(TTL expiry)──► back to origin queue
+  attempt 2 fails ──► q.retry.30s ──(TTL expiry)──► back to origin queue
+  attempt 3 fails ──► q.retry.5m  ──(TTL expiry)──► back to origin queue
+  attempt 4 fails ──► q.dlq (terminal — inspect/replay with tools/replay_dlq.py)
 ```
 
 `tools/seed_commit.py` can publish synthetic `commit.detected` events
@@ -103,6 +130,171 @@ Two call sites, two purposes (`get_llm_client(purpose=...)`, tunable via
   back to a deterministic template (`build_fallback_narrative`) on
   failure, so a report is never missing an explanation.
 
+### Error classification (`shared/errors.py`)
+
+Every failure a consumer or `shared/llm.py` can hit is classified into
+exactly one of three types, each with a distinct routing outcome:
+
+| Type | Examples | Routing |
+|---|---|---|
+| `RetryableError` | HTTP 429/5xx, connection/timeout errors, a transient `git clone`/`fetch` failure | Retry ladder (or `q.dlq` once attempts are exhausted) |
+| `PoisonMessageError` | Contract/schema validation failure, an unknown `schema_version`, a commit SHA that genuinely doesn't exist in the repo, a malformed LLM response | `q.dlq` immediately, zero retry attempts |
+| `FatalError` | Anything unclassified/unexpected | Logged critical, message nacked with `requeue=True` (not lost), service stops (`SystemExit(1)`) rather than grinding through the rest of the queue the same broken way |
+
+`shared/errors.py::classify_exception` handles the provider-agnostic
+cases (HTTP status codes, `httpx` network exceptions) that `shared/llm.py`
+uses directly. Each agent's `main.py` has its own
+`classify_researcher_failure`/`classify_reviewer_failure` on top of that
+for exception types specific to that agent (`CommitNotFoundError`,
+`GitCommandError`, `SlackError`) — kept out of `shared/errors.py`
+deliberately, since `shared/` must never depend on `agents/`.
+
+### Retry ladder (`shared/retry.py`)
+
+RabbitMQ has no native "retry in N seconds" without the (non-default)
+delayed-message-exchange plugin, so this implements the standard
+TTL+dead-letter-exchange "parking lot" pattern by hand: `q.retry.5s` →
+`q.retry.30s` → `q.retry.5m`, each a durable queue with a fixed
+`x-message-ttl` whose `x-dead-letter-exchange` points back at the main
+`swarm.events` exchange. When a message's TTL expires, RabbitMQ
+redelivers it automatically — no relay process needed.
+
+The one subtlety this depends on (verified empirically against a live
+broker before building on it): a TTL-expired message is redelivered
+using the routing key it was *originally published with when it entered
+the expiring queue*, not the queue's own name, as long as the queue
+doesn't set `x-dead-letter-routing-key` itself. Each rung therefore gets
+its own small dedicated topic exchange (bound catch-all, `#`, to exactly
+one queue) purely as a named "entry door" for that delay tier — scheduling
+a retry means picking the rung's exchange and publishing with the
+message's real business routing key (`commit.detected`/`findings.ready`),
+and the main exchange's own topic bindings route it back to the correct
+origin queue for free.
+
+Retry metadata (`x-retry-attempt`, `x-retry-reason`,
+`x-retry-original-queue`, `x-retry-first-failed-at`) travels as AMQP
+message headers, not inside the envelope body — the strict/closed
+contracts from Phase 0-3 stay untouched. `MAX_RETRY_ATTEMPTS` (3, one per
+rung) is derived from the ladder's own length; a 4th failure routes to
+the terminal `q.dlq` instead of another rung.
+
+### DLQ flow and replay
+
+`q.dlq` is one shared, terminal queue for both routing paths: a poison
+message (`RetryLadder.send_raw_to_dlq`, preserving the *original* bytes —
+never reconstructed — since the message may not even be a valid envelope)
+and a retryable failure that exhausted the ladder
+(`RetryLadder.send_to_dlq`). Per-queue `<queue>.dlq` queues still exist
+(from Phase 1's broker topology) as RabbitMQ's own automatic fallback for
+anything nacked without an explicit Phase 4 routing decision.
+
+`tools/replay_dlq.py` inspects and replays it:
+
+```bash
+python -m tools.replay_dlq inspect                                   # list, changes nothing
+python -m tools.replay_dlq replay --original-queue q.commits --dry-run  # preview a replay
+python -m tools.replay_dlq replay --all                              # replay everything
+python -m tools.replay_dlq replay --event-id <id>                    # replay one message
+```
+
+AMQP has no server-side "peek", so inspecting means consuming — the tool
+always drains the queue into memory first, then decides per message:
+`inspect` and `--dry-run` requeue everything unchanged (nothing is ever
+lost or removed); a real replay acks (permanently removes) only the
+messages actually replayed and requeues the rest. A replayed message goes
+straight back to its original queue (default exchange, routing key = the
+queue name recorded in `x-retry-original-queue`) with a fresh attempt
+budget, since a human is presumably replaying only after fixing whatever
+caused the failure.
+
+### Idempotency (`shared/idempotency.py`)
+
+Reuses the `processed_events` table from Phase 0, extended by
+`db/migrations/003_idempotency_claims.sql` with `claimed_at`/
+`completed_at` so a claim and its completion are two distinct states:
+
+1. **Claim** — `INSERT ... ON CONFLICT (event_id) DO NOTHING` before any
+   work starts. Atomic, so two concurrent redeliveries of the same
+   `event_id` can never both proceed — one gets `claimed=True`, the other
+   bails out before doing anything observable (no duplicate Slack
+   message, no duplicate report).
+2. **Perform work** — the consumer's normal pipeline.
+3. **Mark complete** — `mark_complete()`, called once every side effect
+   (publish, persist, notify) has actually happened.
+
+A caught `RetryableError` calls `release()` (deletes the claim) so an
+immediate retry-ladder redelivery can reclaim it. A **hard crash**
+(SIGKILL, OOM-kill) never runs any exception handler at all — no
+`release()`, no `mark_complete()`. Without a way to tell "claimed and
+completed" apart from "claimed, then the process died mid-work", the
+message would survive at the broker (RabbitMQ redelivers an unacked
+message) but the pipeline would silently never produce its output,
+because every redelivery would see the claim as still active. `claim()`
+treats a claim that's neither completed nor reclaimed within
+`IDEMPOTENCY_STALE_CLAIM_SECONDS` (default 300s) as abandoned and lets a
+new caller reclaim it — a completed claim is never reclaimable regardless
+of age.
+
+### Rate limiting (`shared/ratelimit.py`)
+
+A distributed token bucket, Redis-backed so multiple instances of the
+same agent share one limit instead of each enforcing its own in-memory
+bucket, and scoped per `"<provider>:<model>"` (`RATE_LIMIT_TOKENS_PER_MINUTE`,
+overridable per provider via `RATE_LIMIT_<PROVIDER>_TPM`). Refills
+continuously (tokens/ms) rather than resetting at a fixed window
+boundary, so it can't allow a 2x burst right at a window edge. Atomicity
+comes from a Lua script run via Redis `EVAL` — the whole
+read-modify-write happens as one atomic operation, safe across
+concurrent callers in different processes. `shared/llm.py` calls
+`wait_and_acquire()` before every provider request; a Redis outage
+degrades gracefully (logs a warning, proceeds without limiting) rather
+than becoming a new single point of failure for the whole pipeline.
+
+### Circuit breaker (`shared/breaker.py`)
+
+One breaker per LLM provider (shared by every caller in the process),
+standard three-state machine:
+
+- **CLOSED** — normal operation, consecutive failures counted.
+- **OPEN** — after `LLM_BREAKER_FAILURE_THRESHOLD` (default 5)
+  consecutive failures, every call fails fast with `CircuitOpenError`
+  (no network attempt at all) for `LLM_BREAKER_OPEN_SECONDS` (default 60).
+- **HALF_OPEN** — once the open window elapses, the next call is a trial:
+  success closes the breaker and increments `recovery_count`; failure
+  reopens it for another full window.
+
+Integrated into `shared/llm.py::_BaseLLMClient._execute_with_resilience`,
+so every provider (Anthropic/OpenAI/Ollama) gets it automatically. Metrics
+(`failure_count`/`open_count`/`recovery_count`) are logged on every state
+transition.
+
+### LLM retry/backoff
+
+`shared/llm.py::_BaseLLMClient._execute_with_resilience` is the single
+choke point every provider's `complete()` routes through: acquire a rate
+limit token → run the request behind the circuit breaker → on a failure
+classified `RetryableError`, sleep an exponential-backoff-with-full-jitter
+delay (`min(base * 2**(attempt-1), max)`, then a random delay in
+`[0, that)`, to avoid synchronized retry storms across instances) and try
+again, up to `LLM_MAX_RETRIES` (default 3) times. A `PoisonMessageError`
+(malformed response) or an open circuit fails immediately with no
+retries spent on it. Every attempt logs `retry_count`/
+`retry_delay_seconds`/the classified reason.
+
+### Consumer hygiene and graceful shutdown
+
+Both the researcher and reviewer consumers run with `prefetch_count=1`
+(at most one unacked message in flight, so manual ack/nack always applies
+to exactly the message being handled) and manual acknowledgement
+throughout — no more ack-on-success/nack-on-any-exception context
+manager; every outcome (success, retryable failure, poison, fatal) makes
+an explicit, logged routing decision. On SIGTERM/SIGINT, a consumer stops
+accepting new work and gives any in-flight message a bounded
+`GRACEFUL_SHUTDOWN_SECONDS` (default 30) window to finish naturally
+before a hard-cancel fallback; broker/database connections close only
+after. An AMQP heartbeat (`RABBITMQ_HEARTBEAT`, default 60s) lets both
+sides detect a dead connection well before a kernel-level timeout would.
+
 ### Risk scoring methodology
 
 `agents/reviewer/scoring.py::compute_score` is pure code — no model call,
@@ -143,8 +335,13 @@ an error) so local dev/CI never needs a real Slack workspace.
 │   ├── contracts.py         # Envelope + CommitDetected/FindingsReady/ReviewCompleted (Pydantic v2)
 │   ├── logging.py           # structured JSON logging, trace/correlation IDs
 │   ├── broker.py            # aio-pika topology, publish, consume — used by every agent
-│   ├── llm.py                # provider-agnostic LLMClient (Anthropic/OpenAI/Ollama)
-│   └── slack.py              # Block Kit message + incoming-webhook delivery
+│   ├── llm.py                # provider-agnostic LLMClient (Anthropic/OpenAI/Ollama), retry/breaker/rate-limit wired in
+│   ├── slack.py              # Block Kit message + incoming-webhook delivery
+│   ├── errors.py             # RetryableError/PoisonMessageError/FatalError classification
+│   ├── retry.py              # RabbitMQ delayed-retry ladder (q.retry.5s/30s/5m -> q.dlq)
+│   ├── idempotency.py        # claim-before-processing against processed_events
+│   ├── ratelimit.py          # Redis-backed distributed token bucket
+│   └── breaker.py            # CLOSED/OPEN/HALF_OPEN circuit breaker
 ├── db/
 │   ├── migrations/          # schema, applied on first Postgres boot
 │   └── README.md
@@ -165,14 +362,17 @@ an error) so local dev/CI never needs a real Slack workspace.
 │   └── orchestrator/          # placeholder — future topology/retry ownership
 ├── tools/
 │   ├── seed_commit.py        # publish synthetic commit.detected events, no GitHub needed
-│   └── seed_findings.py      # publish synthetic findings.ready events, no researcher needed
+│   ├── seed_findings.py      # publish synthetic findings.ready events, no researcher needed
+│   └── replay_dlq.py         # inspect/filter/replay q.dlq messages
 ├── scripts/
 │   └── validate_stack.sh    # brings the stack up and checks it end-to-end
 ├── tests/
+│   └── test_chaos.py         # repeatable chaos scenarios A-F
 ├── PHASE_0_REPORT.md
 ├── PHASE_1_REPORT.md
 ├── PHASE_2_REPORT.md
-└── PHASE_3_REPORT.md
+├── PHASE_3_REPORT.md
+└── PHASE_4_REPORT.md
 ```
 
 ## Prerequisites
