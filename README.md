@@ -32,6 +32,15 @@ This repo implements:
   cache, AST graph, blast radius, reviewer scoring, and Slack formatting
   are exactly as Phase 3 left them. See
   [`PHASE_4_REPORT.md`](PHASE_4_REPORT.md).
+- **Phase 5: observability** — distributed tracing end-to-end across
+  every RabbitMQ hop (`shared/telemetry.py`, OpenTelemetry, exported to
+  [Arize Phoenix](https://arize.com/docs/phoenix)), a Prometheus metrics
+  catalog (throughput, retries, DLQ, LLM cost/latency, repository/blast
+  radius/Postgres timings) scraped from each service's `/metrics`, and
+  Grafana dashboards over all of it. No business logic changed — watcher,
+  researcher, and reviewer pipelines are exactly as Phase 4 left them,
+  with spans/metrics recording alongside the existing structured logs.
+  See [`PHASE_5_REPORT.md`](PHASE_5_REPORT.md).
 
 ## Architecture
 
@@ -325,15 +334,97 @@ keyed by severity. `SlackNotifier.send()` posts it to `SLACK_WEBHOOK_URL`
 via a plain HTTPS POST; an unconfigured webhook is a no-op (logged, not
 an error) so local dev/CI never needs a real Slack workspace.
 
+### Observability (`shared/telemetry.py`)
+
+One shared module initializes OpenTelemetry for every service:
+`init_telemetry(service_name)` installs a process-wide `TracerProvider`
+and `MeterProvider` exactly once (idempotent — safe to call again),
+entirely driven by environment variables (`OTEL_TRACES_EXPORTER` /
+`OTEL_METRICS_EXPORTER`: `otlp_http` | `otlp_grpc` | `console` | `none`,
+plus `prometheus` for metrics), and returns a tracer/meter scoped to that
+service. No agent branches on "is tracing configured" — an unconfigured
+exporter degrades to a real (harmless) no-op provider, the same pattern
+`shared/llm.py`'s `NullLLMClient` already established for a missing LLM
+provider.
+
+**Tracing.** `shared/broker.py::Broker.publish()` opens a PRODUCER span
+and injects its W3C `traceparent` into the AMQP message headers
+(alongside the existing business `trace_id` header from Phase 0);
+`telemetry.consumer_span()` — called at the top of every consumer's
+`handle_message()`, right next to the existing `trace_context(...)` — 
+extracts that header and continues the *same* trace as a CONSUMER span's
+child. This is what makes one trace survive
+`watcher → RabbitMQ → researcher → RabbitMQ → reviewer → Slack` instead
+of restarting at every hop: verified live against a real Phoenix instance
+in this repo (see PHASE_5_REPORT.md's "Distributed trace validation" —
+one `trace_id` covering 13 spans across all three services, including the
+Slack delivery). Every stage the roadmap asked for is its own span:
+webhook processing, RabbitMQ publish/consume, repository
+clone/refresh, graph build, blast-radius analysis, database writes, LLM
+requests, review generation, and Slack delivery. `shared/logging.py`'s
+`JsonFormatter` also stamps every log line with `otel_trace_id`/
+`otel_span_id` (reading the *currently active* span, if any) alongside
+the pre-existing business `trace_id`/`correlation_id`, so a log line and
+a Phoenix trace can always be cross-referenced in either direction.
+
+**Metrics.** `shared/telemetry.py::Metrics` is a single catalog of every
+counter/histogram the roadmap asked for (event throughput, retry/DLQ
+counts, circuit-breaker opens, rate-limit delays, LLM
+calls/failures/tokens/cost/duration, Slack deliveries, repository
+clone/cache-hit/duration, blast-radius/review/database durations,
+Postgres pool/failures), created once off whatever meter the current
+process has (a real one after `init_telemetry()`, a no-op before it — the
+same test-safety pattern as tracing). Instruments are recorded at the
+exact point each event already happens in the code (e.g.
+`shared/retry.py::schedule_retry`, `shared/breaker.py`'s `OPEN`
+transition, `agents/researcher/db.py::blast_radius`) — no polling, no
+separate collector process. Exported as a Prometheus exposition endpoint
+by default: researcher/reviewer each open their own (`RESEARCHER_METRICS_PORT`/
+`REVIEWER_METRICS_PORT`, default 9102/9103); the watcher mounts
+`/metrics` on its existing FastAPI app instead of a second port
+(`prometheus_client.make_asgi_app()`).
+
+**LLM cost.** `shared/llm.py::_BaseLLMClient._execute_with_resilience`
+(the single choke point every provider's `complete()` already routes
+through — see "LLM retry/backoff" above) wraps its retry loop in one
+`llm.request` CLIENT span and records `llm_calls`/`llm_failures`/
+`retry_count`/breaker-state on it; `_log_usage()` (called once per
+successful response, already logging token counts) additionally calls
+`telemetry.record_llm_success()`, which estimates cost from
+`telemetry.PRICING_PER_1M_TOKENS_USD` (env-overridable per model,
+`LLM_PRICE_<MODEL>_IN_PER_1M`/`_OUT_PER_1M`) and records it as both a
+span attribute and the `swarm_llm_cost_usd_total` counter.
+
+**Docker services.** `docker-compose.yml` adds Phoenix (OTLP receiver +
+UI, persisted to a named volume), Prometheus (scrapes every service's
+`/metrics`, config in `observability/prometheus/prometheus.yml`), Grafana
+(three dashboards auto-provisioned from
+`observability/grafana/provisioning/dashboards/json/`), and a Postgres
+exporter; RabbitMQ gets its `rabbitmq_prometheus` plugin enabled via a
+mounted `enabled_plugins` file. All four new/changed services use
+`network_mode: host` on Linux — see PHASE_5_REPORT.md's "Known
+limitations" for exactly why (short version: this sandbox's Docker
+daemon blocks fresh container-to-container bridge traffic, while
+host↔container via a published port — the same path every existing
+agent already uses for Postgres/RabbitMQ/Redis — works reliably).
+
 ## Repo structure
 
 ```
 .
-├── docker-compose.yml       # RabbitMQ, Postgres, Redis
+├── docker-compose.yml       # RabbitMQ, Postgres, Redis, Phoenix, Prometheus, Grafana, postgres-exporter
 ├── .env.example             # every environment variable, documented
+├── observability/
+│   ├── rabbitmq/enabled_plugins        # enables rabbitmq_prometheus
+│   ├── prometheus/prometheus.yml       # scrape config (all 6 targets)
+│   └── grafana/provisioning/
+│       ├── datasources/datasources.yml # Prometheus datasource
+│       └── dashboards/
+│           ├── dashboards.yml          # file-provider pointing at json/
+│           └── json/                   # System Overview, LLM, Repository dashboards
 ├── shared/
 │   ├── contracts.py         # Envelope + CommitDetected/FindingsReady/ReviewCompleted (Pydantic v2)
-│   ├── logging.py           # structured JSON logging, trace/correlation IDs
+│   ├── logging.py           # structured JSON logging, trace/correlation IDs, otel_trace_id/otel_span_id
 │   ├── broker.py            # aio-pika topology, publish, consume — used by every agent
 │   ├── llm.py                # provider-agnostic LLMClient (Anthropic/OpenAI/Ollama), retry/breaker/rate-limit wired in
 │   ├── slack.py              # Block Kit message + incoming-webhook delivery
@@ -341,38 +432,42 @@ an error) so local dev/CI never needs a real Slack workspace.
 │   ├── retry.py              # RabbitMQ delayed-retry ladder (q.retry.5s/30s/5m -> q.dlq)
 │   ├── idempotency.py        # claim-before-processing against processed_events
 │   ├── ratelimit.py          # Redis-backed distributed token bucket
-│   └── breaker.py            # CLOSED/OPEN/HALF_OPEN circuit breaker
+│   ├── breaker.py            # CLOSED/OPEN/HALF_OPEN circuit breaker
+│   └── telemetry.py          # OpenTelemetry tracing/metrics init, propagation, cost estimation
 ├── db/
 │   ├── migrations/          # schema, applied on first Postgres boot
 │   └── README.md
 ├── agents/
-│   ├── watcher/              # GitHub webhook -> commit.detected (FastAPI)
+│   ├── watcher/              # GitHub webhook -> commit.detected (FastAPI), mounts /metrics
 │   ├── researcher/           # commit.detected -> repo clone, AST graph, blast radius -> findings.ready
-│   │   ├── repository.py     # local git clone/cache
+│   │   ├── repository.py     # local git clone/cache (clone/refresh spans + metrics)
 │   │   ├── graph.py          # AST import analysis -> DependencyGraph
 │   │   ├── impact.py         # in-memory blast-radius traversal
-│   │   ├── db.py             # Postgres upserts + recursive-CTE blast radius
+│   │   ├── db.py             # Postgres upserts + recursive-CTE blast radius (spans + metrics)
 │   │   ├── sensitive.py      # sensitive-path detection
 │   │   ├── diff.py            # best-effort truncated `git show` diff
 │   │   └── summarize.py       # LLM semantic-summary generation
 │   ├── reviewer/              # findings.ready -> risk score + narrative -> review.completed
 │   │   ├── scoring.py          # deterministic risk scoring (no LLM)
 │   │   ├── prompts.py          # narrative prompt + deterministic fallback
-│   │   └── storage.py          # Postgres persistence + idempotency
+│   │   └── storage.py          # Postgres persistence + idempotency (spans + metrics)
 │   └── orchestrator/          # placeholder — future topology/retry ownership
 ├── tools/
 │   ├── seed_commit.py        # publish synthetic commit.detected events, no GitHub needed
 │   ├── seed_findings.py      # publish synthetic findings.ready events, no researcher needed
-│   └── replay_dlq.py         # inspect/filter/replay q.dlq messages
+│   ├── replay_dlq.py         # inspect/filter/replay q.dlq messages
+│   └── load_test.py          # Phase 5 performance test — N synthetic commits, latency/throughput
 ├── scripts/
 │   └── validate_stack.sh    # brings the stack up and checks it end-to-end
 ├── tests/
-│   └── test_chaos.py         # repeatable chaos scenarios A-F
+│   ├── test_chaos.py         # repeatable chaos scenarios A-F
+│   └── test_telemetry.py     # span/propagation/metrics/OTel-setup tests
 ├── PHASE_0_REPORT.md
 ├── PHASE_1_REPORT.md
 ├── PHASE_2_REPORT.md
 ├── PHASE_3_REPORT.md
-└── PHASE_4_REPORT.md
+├── PHASE_4_REPORT.md
+└── PHASE_5_REPORT.md
 ```
 
 ## Prerequisites
@@ -421,6 +516,26 @@ an error) so local dev/CI never needs a real Slack workspace.
   (or read `DATABASE_URL` from `.env`)
 - **Redis:** `redis://:swarm_dev_password@localhost:6379/0`
   (or read `REDIS_URL` from `.env`)
+- **Phoenix (traces):** http://localhost:6006 — every service's spans,
+  with LLM-call detail (prompt/response, token usage) once a real
+  provider is configured.
+- **Prometheus:** http://localhost:9090 — raw metrics + the
+  [Targets](http://localhost:9090/targets) page to check scrape health.
+- **Grafana:** http://localhost:3000 (`admin`/`admin` by default, see
+  `GRAFANA_ADMIN_USER`/`GRAFANA_ADMIN_PASSWORD`) — three dashboards
+  auto-provisioned under the "Code Review Swarm" folder: System Overview,
+  LLM, and Repository.
+- **watcher/researcher/reviewer `/metrics`:** http://localhost:8001/metrics,
+  http://localhost:9102/metrics, http://localhost:9103/metrics — what
+  Prometheus scrapes; useful to check directly while developing a new
+  metric.
+
+Phoenix/Prometheus/Grafana run with `network_mode: host` (Linux), so they
+reach the RabbitMQ/Postgres containers and the host-process
+watcher/researcher/reviewer the same way everything else in this stack
+already does — via `localhost:<port>`, not container DNS. See
+PHASE_5_REPORT.md if you're deploying this on Docker Desktop (Mac/Windows)
+or a non-Linux host, where host networking behaves differently.
 
 ## Shared contracts
 
