@@ -28,8 +28,22 @@ This means:
 |--------------------|-----------------------------------------------------------------------|
 | `modules`          | Source modules/files discovered per repo.                            |
 | `imports`          | Import edges between modules (dependency graph).                     |
-| `commits`          | Commits detected by ingestion and their review status.                |
+| `commits`          | Commits detected by ingestion and their review status. **Not yet written to by any agent** — see Known limitations in `PHASE_3_REPORT.md`. |
 | `findings`         | Individual issues raised by analysis agents against a commit.        |
-| `reports`          | Aggregated review report generated per commit.                       |
-| `processed_events` | Idempotency ledger — one row per successfully processed `event_id`.  |
-| `audit_log`        | Append-only record of notable events across the system.              |
+| `reports`          | Reviewer output per commit: score, severity, narrative, blast radius, sensitive hits (extended by `002_reviewer_reports.sql` — see that file's header for why `commit_id` is nullable and `repo`/`commit_sha` live directly on the row). |
+| `processed_events` | Idempotency ledger — one row per successfully processed `event_id`. First used by `agents/reviewer` (Phase 3) to dedupe `findings.ready` redeliveries. |
+| `audit_log`        | Append-only record of notable events across the system. Still unused. |
+
+## Applying `002_reviewer_reports.sql` to an already-running stack
+
+`docker-entrypoint-initdb.d` only runs against a fresh volume (see above),
+so a Postgres container started before Phase 3 needs this migration
+applied by hand once:
+
+```bash
+docker compose exec -T postgres psql -U "${POSTGRES_USER:-swarm}" -d "${POSTGRES_DB:-code_review_swarm}" \
+    < db/migrations/002_reviewer_reports.sql
+```
+
+A fresh `docker compose up -d` (new volume, or after `docker compose down -v`)
+picks it up automatically alongside `001_init_schema.sql`.
