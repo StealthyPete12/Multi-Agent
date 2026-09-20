@@ -126,17 +126,23 @@ class Database:
                 async with self.pool.acquire() as conn:
                     async with conn.transaction():
                         for module in graph.modules.values():
-                            module_id = await self.upsert_module(conn, repo, module.path, module.name, "python")
+                            module_id = await self.upsert_module(
+                                conn, repo, module.path, module.name, "python"
+                            )
                             module_ids[module.name] = module_id
                         for module_name, module_id in module_ids.items():
-                            await self.replace_imports(conn, module_id, edges_by_module.get(module_name, []))
+                            await self.replace_imports(
+                                conn, module_id, edges_by_module.get(module_name, [])
+                            )
             except Exception:
                 telemetry.get_metrics().db_failures.add(1, {"operation": "store_graph"})
                 raise
 
             duration_ms = (time.monotonic() - started) * 1000
             current_span.set_attribute("swarm.duration_ms", duration_ms)
-            telemetry.get_metrics().db_write_duration_ms.record(duration_ms, {"table": "modules", "operation": "store_graph"})
+            telemetry.get_metrics().db_write_duration_ms.record(
+                duration_ms, {"table": "modules", "operation": "store_graph"}
+            )
             log.info(
                 "graph persisted",
                 extra={
@@ -214,7 +220,7 @@ class Database:
             chains=chains,
         )
 
-    async def __aenter__(self) -> "Database":
+    async def __aenter__(self) -> Database:
         await self.connect()
         return self
 

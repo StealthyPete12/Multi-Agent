@@ -44,9 +44,8 @@ Usage::
 from __future__ import annotations
 
 import os
-import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import aio_pika
@@ -116,7 +115,9 @@ def _build_ladder(exchange_prefix: str) -> tuple[RetryRung, ...]:
     )
 
 
-RETRY_LADDER: tuple[RetryRung, ...] = _build_ladder(os.environ.get("RABBITMQ_EXCHANGE", "swarm.events"))
+RETRY_LADDER: tuple[RetryRung, ...] = _build_ladder(
+    os.environ.get("RABBITMQ_EXCHANGE", "swarm.events")
+)
 
 # attempt 1 -> 5s, attempt 2 -> 30s, attempt 3 -> 5m, attempt 4 -> DLQ.
 MAX_RETRY_ATTEMPTS = len(RETRY_LADDER)
@@ -127,7 +128,7 @@ class RetryLadder:
     a message through it, on top of an already-connected :class:`Broker`.
     """
 
-    def __init__(self, broker: "Broker", *, ladder: tuple[RetryRung, ...] = RETRY_LADDER) -> None:
+    def __init__(self, broker: Broker, *, ladder: tuple[RetryRung, ...] = RETRY_LADDER) -> None:
         self.broker = broker
         self.ladder = ladder
         self._dlq_declared = False
@@ -183,7 +184,7 @@ class RetryLadder:
 
     async def schedule_retry(
         self,
-        envelope: "Envelope",
+        envelope: Envelope,
         *,
         routing_key: str,
         reason: str,
@@ -214,7 +215,7 @@ class RetryLadder:
                 HEADER_ATTEMPT: attempt,
                 HEADER_REASON: reason[:500],
                 HEADER_ORIGINAL_QUEUE: original_queue,
-                HEADER_FIRST_FAILED_AT: first_failed_at or datetime.now(timezone.utc).isoformat(),
+                HEADER_FIRST_FAILED_AT: first_failed_at or datetime.now(UTC).isoformat(),
             },
         )
         await exchange.publish(message, routing_key=routing_key)
@@ -229,12 +230,14 @@ class RetryLadder:
                 "original_queue": original_queue,
             },
         )
-        telemetry.get_metrics().retry_count.add(1, {"original_queue": original_queue, "rung": rung.name})
+        telemetry.get_metrics().retry_count.add(
+            1, {"original_queue": original_queue, "rung": rung.name}
+        )
         return rung
 
     async def send_to_dlq(
         self,
-        envelope: "Envelope",
+        envelope: Envelope,
         *,
         reason: str,
         attempt: int,
@@ -261,7 +264,7 @@ class RetryLadder:
                 HEADER_ATTEMPT: attempt,
                 HEADER_REASON: reason[:500],
                 HEADER_ORIGINAL_QUEUE: original_queue,
-                HEADER_FIRST_FAILED_AT: first_failed_at or datetime.now(timezone.utc).isoformat(),
+                HEADER_FIRST_FAILED_AT: first_failed_at or datetime.now(UTC).isoformat(),
             },
         )
         await self.broker.channel.default_exchange.publish(message, routing_key=DLQ_QUEUE_NAME)
@@ -276,7 +279,9 @@ class RetryLadder:
                 "original_queue": original_queue,
             },
         )
-        telemetry.get_metrics().dlq_count.add(1, {"original_queue": original_queue, "poison": "false"})
+        telemetry.get_metrics().dlq_count.add(
+            1, {"original_queue": original_queue, "poison": "false"}
+        )
 
     async def send_raw_to_dlq(
         self,
@@ -300,7 +305,7 @@ class RetryLadder:
                 HEADER_ATTEMPT: 0,
                 HEADER_REASON: reason[:500],
                 HEADER_ORIGINAL_QUEUE: original_queue,
-                HEADER_FIRST_FAILED_AT: datetime.now(timezone.utc).isoformat(),
+                HEADER_FIRST_FAILED_AT: datetime.now(UTC).isoformat(),
             },
         )
         await self.broker.channel.default_exchange.publish(message, routing_key=DLQ_QUEUE_NAME)
@@ -312,4 +317,6 @@ class RetryLadder:
                 "original_queue": original_queue,
             },
         )
-        telemetry.get_metrics().dlq_count.add(1, {"original_queue": original_queue, "poison": "true"})
+        telemetry.get_metrics().dlq_count.add(
+            1, {"original_queue": original_queue, "poison": "true"}
+        )

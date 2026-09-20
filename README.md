@@ -351,7 +351,7 @@ provider.
 and injects its W3C `traceparent` into the AMQP message headers
 (alongside the existing business `trace_id` header from Phase 0);
 `telemetry.consumer_span()` — called at the top of every consumer's
-`handle_message()`, right next to the existing `trace_context(...)` — 
+`handle_message()`, right next to the existing `trace_context(...)` —
 extracts that header and continues the *same* trace as a CONSUMER span's
 child. This is what makes one trace survive
 `watcher → RabbitMQ → researcher → RabbitMQ → reviewer → Slack` instead

@@ -5,9 +5,7 @@ import aio_pika
 import asyncpg
 import pytest
 
-RABBITMQ_URL = os.environ.get(
-    "RABBITMQ_URL", "amqp://swarm:swarm_dev_password@localhost:5672/"
-)
+RABBITMQ_URL = os.environ.get("RABBITMQ_URL", "amqp://swarm:swarm_dev_password@localhost:5672/")
 DATABASE_URL = os.environ.get(
     "DATABASE_URL", "postgresql://swarm:swarm_dev_password@localhost:5432/code_review_swarm"
 )

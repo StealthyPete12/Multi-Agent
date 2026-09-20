@@ -53,7 +53,7 @@ async def get_truncated_diff(
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, _ = await asyncio.wait_for(process.communicate(), timeout=10)
-    except (OSError, asyncio.TimeoutError):
+    except (TimeoutError, OSError):
         return ""
 
     if process.returncode != 0:

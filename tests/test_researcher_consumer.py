@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -54,7 +54,9 @@ class FakeDatabase:
         self.stored.append((repo, graph))
         return {name: f"id-{name}" for name in graph.modules}
 
-    async def blast_radius(self, repo: str, changed_module_names, *, max_depth: int) -> BlastRadiusResult:
+    async def blast_radius(
+        self, repo: str, changed_module_names, *, max_depth: int
+    ) -> BlastRadiusResult:
         return self._blast_radius_result
 
 
@@ -85,11 +87,18 @@ class FakeRetryLadder:
 
     async def send_to_dlq(self, envelope, *, reason, attempt, original_queue):
         self.dlq.append(
-            {"envelope": envelope, "reason": reason, "attempt": attempt, "original_queue": original_queue}
+            {
+                "envelope": envelope,
+                "reason": reason,
+                "attempt": attempt,
+                "original_queue": original_queue,
+            }
         )
 
     async def send_raw_to_dlq(self, raw_body, *, reason, original_queue):
-        self.raw_dlq.append({"raw_body": raw_body, "reason": reason, "original_queue": original_queue})
+        self.raw_dlq.append(
+            {"raw_body": raw_body, "reason": reason, "original_queue": original_queue}
+        )
 
 
 class FakeIdempotency:
@@ -116,15 +125,15 @@ def _write_sample_repo(root: Path) -> None:
 
 
 def _sample_commit(**overrides) -> CommitDetected:
-    defaults = dict(
-        repo="acme/widgets",
-        commit_sha="a" * 40,
-        branch="main",
-        author="jane",
-        message="fix: bug",
-        committed_at=datetime.now(timezone.utc),
-        changed_files=["database.py"],
-    )
+    defaults = {
+        "repo": "acme/widgets",
+        "commit_sha": "a" * 40,
+        "branch": "main",
+        "author": "jane",
+        "message": "fix: bug",
+        "committed_at": datetime.now(UTC),
+        "changed_files": ["database.py"],
+    }
     defaults.update(overrides)
     return CommitDetected(**defaults)
 
@@ -138,9 +147,7 @@ async def test_analyze_commit_builds_findings_ready_with_blast_radius(tmp_path):
         )
     )
 
-    findings = await analyze_commit(
-        _sample_commit(), repo_cache=repo_cache, database=database
-    )
+    findings = await analyze_commit(_sample_commit(), repo_cache=repo_cache, database=database)
 
     assert isinstance(findings, FindingsReady)
     assert findings.repo == "acme/widgets"
@@ -170,27 +177,27 @@ async def test_analyze_commit_detects_sensitive_paths(tmp_path):
 
 
 def _handle_kwargs(broker, repo_cache, database, retry_ladder=None, idempotency=None):
-    return dict(
-        broker=broker,
-        repo_cache=repo_cache,
-        database=database,
-        retry_ladder=retry_ladder or FakeRetryLadder(),
-        idempotency=idempotency or FakeIdempotency(),
-    )
+    return {
+        "broker": broker,
+        "repo_cache": repo_cache,
+        "database": database,
+        "retry_ladder": retry_ladder or FakeRetryLadder(),
+        "idempotency": idempotency or FakeIdempotency(),
+    }
 
 
 async def test_handle_message_valid_commit_publishes_findings_ready(tmp_path):
     _write_sample_repo(tmp_path)
-    envelope = make_envelope(
-        _sample_commit(), event_type=EventType.COMMIT_DETECTED, source="test"
-    )
+    envelope = make_envelope(_sample_commit(), event_type=EventType.COMMIT_DETECTED, source="test")
     broker = FakeBroker()
     repo_cache = FakeRepositoryCache(tmp_path)
     database = FakeDatabase()
     idempotency = FakeIdempotency()
     message = FakeMessage(envelope.to_bytes())
 
-    await handle_message(message, **_handle_kwargs(broker, repo_cache, database, idempotency=idempotency))
+    await handle_message(
+        message, **_handle_kwargs(broker, repo_cache, database, idempotency=idempotency)
+    )
 
     assert len(broker.published) == 1
     findings_envelope, routing_key = broker.published[0]
@@ -213,7 +220,9 @@ async def test_handle_message_rejects_invalid_contract_routes_to_dlq():
     retry_ladder = FakeRetryLadder()
     message = FakeMessage(bad_body)
 
-    await handle_message(message, **_handle_kwargs(broker, repo_cache, database, retry_ladder=retry_ladder))
+    await handle_message(
+        message, **_handle_kwargs(broker, repo_cache, database, retry_ladder=retry_ladder)
+    )
 
     assert broker.published == []
     assert message.acked is True
@@ -230,7 +239,9 @@ async def test_handle_message_skips_duplicate_delivery(tmp_path):
     idempotency = FakeIdempotency(already_claimed=True)
     message = FakeMessage(envelope.to_bytes())
 
-    await handle_message(message, **_handle_kwargs(broker, repo_cache, database, idempotency=idempotency))
+    await handle_message(
+        message, **_handle_kwargs(broker, repo_cache, database, idempotency=idempotency)
+    )
 
     assert broker.published == []
     assert message.acked is True
@@ -240,7 +251,9 @@ async def test_handle_message_skips_duplicate_delivery(tmp_path):
 async def test_handle_message_retryable_failure_schedules_retry(tmp_path):
     envelope = make_envelope(_sample_commit(), event_type=EventType.COMMIT_DETECTED, source="test")
     broker = FakeBroker()
-    repo_cache = FakeRepositoryCache(tmp_path, raises=GitCommandError("clone failed: connection reset"))
+    repo_cache = FakeRepositoryCache(
+        tmp_path, raises=GitCommandError("clone failed: connection reset")
+    )
     database = FakeDatabase()
     retry_ladder = FakeRetryLadder()
     idempotency = FakeIdempotency()

@@ -1,5 +1,3 @@
-import os
-
 import pytest
 
 from agents.researcher.sensitive import detect_sensitive_hits, get_sensitive_patterns

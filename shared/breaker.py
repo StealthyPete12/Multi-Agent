@@ -24,9 +24,10 @@ without needing a metrics backend.
 from __future__ import annotations
 
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import Awaitable, Callable, TypeVar
+from enum import StrEnum
+from typing import TypeVar
 
 from shared import telemetry
 from shared.logging import configure_logging
@@ -38,7 +39,7 @@ log = configure_logging(service_name="breaker")
 T = TypeVar("T")
 
 
-class CircuitState(str, Enum):
+class CircuitState(StrEnum):
     CLOSED = "closed"
     OPEN = "open"
     HALF_OPEN = "half_open"

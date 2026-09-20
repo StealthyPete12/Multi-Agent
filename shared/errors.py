@@ -75,7 +75,9 @@ def classify_http_status(status_code: int) -> bool:
     return status_code in RETRYABLE_STATUS_CODES or status_code >= 500
 
 
-def classify_exception(exc: BaseException) -> type[RetryableError | PoisonMessageError | FatalError]:
+def classify_exception(
+    exc: BaseException,
+) -> type[RetryableError | PoisonMessageError | FatalError]:
     """Map a raw exception (typically from an HTTP client) to one of the
     three error categories.
 
@@ -90,7 +92,10 @@ def classify_exception(exc: BaseException) -> type[RetryableError | PoisonMessag
         status_code = exc.response.status_code
         return RetryableError if classify_http_status(status_code) else PoisonMessageError
 
-    if isinstance(exc, (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError, httpx.RemoteProtocolError)):
+    if isinstance(
+        exc,
+        (httpx.TimeoutException, httpx.ConnectError, httpx.NetworkError, httpx.RemoteProtocolError),
+    ):
         return RetryableError
 
     if isinstance(exc, httpx.HTTPError):

@@ -94,7 +94,9 @@ async def test_anthropic_client_success(httpx_mock):
             "stop_reason": "end_turn",
         },
     )
-    client = AnthropicClient(api_key="sk-test", model="claude-haiku-4-5-20251001", rate_limit_enabled=False)
+    client = AnthropicClient(
+        api_key="sk-test", model="claude-haiku-4-5-20251001", rate_limit_enabled=False
+    )
     response = await client.complete(system="sys", prompt="hi", max_tokens=50)
     assert response.text == "a short summary."
     assert response.provider == "anthropic"
@@ -148,7 +150,9 @@ async def test_ollama_client_success(httpx_mock):
             "done": True,
         },
     )
-    client = OllamaClient(base_url="http://localhost:11434", model="llama3.1", rate_limit_enabled=False)
+    client = OllamaClient(
+        base_url="http://localhost:11434", model="llama3.1", rate_limit_enabled=False
+    )
     response = await client.complete(system="sys", prompt="hi", max_tokens=50)
     assert response.text == "a summary"
     assert response.provider == "ollama"

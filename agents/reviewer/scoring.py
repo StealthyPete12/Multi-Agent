@@ -57,6 +57,7 @@ _STATUS_BY_SEVERITY: dict[Severity, Literal["passed", "failed", "needs_review"]]
 def status_for_severity(severity: Severity) -> Literal["passed", "failed", "needs_review"]:
     return _STATUS_BY_SEVERITY[severity]
 
+
 DEFAULT_TEST_PATH_MARKERS: tuple[str, ...] = ("test_", "_test.py", "tests/", "/test/", "spec/")
 
 
@@ -147,7 +148,9 @@ def compute_score(
     cfg = config or get_scoring_config()
 
     blast_radius_points = _bucket_points(findings.blast_radius.max_depth, cfg.blast_radius_buckets)
-    impact_count_points = _bucket_points(findings.blast_radius.impact_count, cfg.impact_count_buckets)
+    impact_count_points = _bucket_points(
+        findings.blast_radius.impact_count, cfg.impact_count_buckets
+    )
     changed_files_points = _bucket_points(len(findings.changed_files), cfg.changed_files_buckets)
 
     hits = len(findings.sensitive_hits)
@@ -159,7 +162,9 @@ def compute_score(
         sensitive_hits_points = cfg.sensitive_hits_multiple
 
     proximate = has_test_proximity(
-        findings.changed_files, findings.blast_radius.impacted_modules, markers=cfg.test_path_markers
+        findings.changed_files,
+        findings.blast_radius.impacted_modules,
+        markers=cfg.test_path_markers,
     )
     test_proximity_points = 0 if proximate else cfg.test_proximity_penalty
 

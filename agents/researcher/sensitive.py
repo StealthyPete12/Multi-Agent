@@ -29,9 +29,7 @@ def get_sensitive_patterns() -> list[str]:
     return list(DEFAULT_SENSITIVE_PATTERNS)
 
 
-def detect_sensitive_hits(
-    changed_files: list[str], patterns: list[str] | None = None
-) -> list[str]:
+def detect_sensitive_hits(changed_files: list[str], patterns: list[str] | None = None) -> list[str]:
     """Return the subset of ``changed_files`` whose path contains any of
     ``patterns`` (substring match, forward-slash normalized)."""
     active_patterns = patterns if patterns is not None else get_sensitive_patterns()

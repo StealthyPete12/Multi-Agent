@@ -1,5 +1,3 @@
-import pytest
-
 from agents.researcher.summarize import generate_semantic_summary
 from shared.llm import LLMError, LLMResponse
 
@@ -12,7 +10,12 @@ class FakeLLMClient:
 
     async def complete(self, *, system, prompt, max_tokens, temperature=0.2):
         self.calls.append(
-            {"system": system, "prompt": prompt, "max_tokens": max_tokens, "temperature": temperature}
+            {
+                "system": system,
+                "prompt": prompt,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+            }
         )
         if self.raises:
             raise LLMError("boom")

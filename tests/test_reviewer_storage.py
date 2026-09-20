@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -9,19 +9,19 @@ from shared.contracts import BlastRadius, FindingsReady
 
 
 def _findings(**overrides) -> FindingsReady:
-    now = datetime.now(timezone.utc)
-    defaults = dict(
-        commit_sha=uuid.uuid4().hex[:12],
-        agent_name="researcher",
-        findings=[],
-        started_at=now,
-        completed_at=now,
-        repo=f"test/{uuid.uuid4().hex[:8]}",
-        changed_files=["auth/login.py"],
-        blast_radius=BlastRadius(impacted_modules=["auth.login"], impact_count=1, max_depth=1),
-        sensitive_hits=["auth/login.py"],
-        semantic_summary="Touches login validation.",
-    )
+    now = datetime.now(UTC)
+    defaults = {
+        "commit_sha": uuid.uuid4().hex[:12],
+        "agent_name": "researcher",
+        "findings": [],
+        "started_at": now,
+        "completed_at": now,
+        "repo": f"test/{uuid.uuid4().hex[:8]}",
+        "changed_files": ["auth/login.py"],
+        "blast_radius": BlastRadius(impacted_modules=["auth.login"], impact_count=1, max_depth=1),
+        "sensitive_hits": ["auth/login.py"],
+        "semantic_summary": "Touches login validation.",
+    }
     defaults.update(overrides)
     return FindingsReady(**defaults)
 

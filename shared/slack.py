@@ -11,7 +11,6 @@ from __future__ import annotations
 import os
 
 import httpx
-
 from opentelemetry.trace import SpanKind
 
 from shared import telemetry
@@ -71,7 +70,11 @@ def build_review_message(
     blocks = [
         {
             "type": "header",
-            "text": {"type": "plain_text", "text": f"Code Review: {severity.upper()}", "emoji": True},
+            "text": {
+                "type": "plain_text",
+                "text": f"Code Review: {severity.upper()}",
+                "emoji": True,
+            },
         },
         {
             "type": "section",
@@ -113,8 +116,12 @@ class SlackNotifier:
     best-effort notification, not a pipeline-blocking dependency in an
     environment where no webhook has been set up (e.g. local dev/CI)."""
 
-    def __init__(self, webhook_url: str | None = None, *, timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS) -> None:
-        self.webhook_url = webhook_url if webhook_url is not None else os.environ.get("SLACK_WEBHOOK_URL", "")
+    def __init__(
+        self, webhook_url: str | None = None, *, timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
+    ) -> None:
+        self.webhook_url = (
+            webhook_url if webhook_url is not None else os.environ.get("SLACK_WEBHOOK_URL", "")
+        )
         self.timeout_seconds = timeout_seconds
 
     @property
@@ -130,7 +137,9 @@ class SlackNotifier:
         delivery actually fails, so a caller can tell "not set up" apart
         from "broken".
         """
-        with telemetry.span("slack.deliver", kind=SpanKind.CLIENT, tracer_name="shared.slack") as current_span:
+        with telemetry.span(
+            "slack.deliver", kind=SpanKind.CLIENT, tracer_name="shared.slack"
+        ) as current_span:
             if not self.is_configured:
                 log.info("slack webhook not configured, skipping notification")
                 current_span.set_attribute("slack.configured", False)

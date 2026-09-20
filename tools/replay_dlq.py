@@ -41,11 +41,12 @@ import asyncio
 import json
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import aio_pika
 
 from shared.broker import Broker
+from shared.logging import configure_logging
 from shared.retry import (
     DLQ_QUEUE_NAME,
     HEADER_ATTEMPT,
@@ -53,14 +54,32 @@ from shared.retry import (
     HEADER_ORIGINAL_QUEUE,
     HEADER_REASON,
 )
-from shared.logging import configure_logging
 
 log = configure_logging(service_name="replay_dlq")
 
 
+def _header_int(value: object, default: int) -> int:
+    """Coerce an AMQP field-table header value to int. Headers this tool
+    reads are always written as plain ints by ``shared/retry.py``, but the
+    AMQP decoder's declared value type is a broad union (bytes/Decimal/
+    datetime/...), so this stays defensive rather than assuming that."""
+    if value is None:
+        return default
+    try:
+        return int(value)  # type: ignore[call-overload]
+    except (TypeError, ValueError):
+        return default
+
+
+def _header_str_or_none(value: object) -> str | None:
+    if value is None:
+        return None
+    return value.decode() if isinstance(value, bytes) else str(value)
+
+
 @dataclass
 class DlqEntry:
-    message: aio_pika.IncomingMessage
+    message: aio_pika.abc.AbstractIncomingMessage
     event_id: str | None
     event_type: str | None
     repo: str | None
@@ -71,7 +90,7 @@ class DlqEntry:
     first_failed_at: str | None
 
     @classmethod
-    def from_message(cls, message: aio_pika.IncomingMessage) -> "DlqEntry":
+    def from_message(cls, message: aio_pika.abc.AbstractIncomingMessage) -> DlqEntry:
         headers = message.headers or {}
         event_id = None
         event_type = None
@@ -93,10 +112,10 @@ class DlqEntry:
             event_type=event_type,
             repo=repo,
             commit_sha=commit_sha,
-            attempt=int(headers.get(HEADER_ATTEMPT, 0) or 0),
-            reason=str(headers.get(HEADER_REASON, "")),
-            original_queue=str(headers.get(HEADER_ORIGINAL_QUEUE, "unknown")),
-            first_failed_at=headers.get(HEADER_FIRST_FAILED_AT),
+            attempt=_header_int(headers.get(HEADER_ATTEMPT), 0),
+            reason=_header_str_or_none(headers.get(HEADER_REASON)) or "",
+            original_queue=_header_str_or_none(headers.get(HEADER_ORIGINAL_QUEUE)) or "unknown",
+            first_failed_at=_header_str_or_none(headers.get(HEADER_FIRST_FAILED_AT)),
         )
 
     def summary(self) -> dict:
@@ -182,7 +201,9 @@ async def cmd_inspect(args: argparse.Namespace) -> None:
 
 async def cmd_replay(args: argparse.Namespace) -> None:
     if not (args.all or args.event_id or args.original_queue or args.reason_contains or args.repo):
-        print("refusing to replay: pass --all or a filter (--event-id/--original-queue/--reason-contains/--repo)")
+        print(
+            "refusing to replay: pass --all or a filter (--event-id/--original-queue/--reason-contains/--repo)"
+        )
         sys.exit(2)
 
     broker = Broker()
@@ -210,7 +231,7 @@ async def cmd_replay(args: argparse.Namespace) -> None:
                 type=entry.message.type,
                 headers={
                     "trace_id": (entry.message.headers or {}).get("trace_id"),
-                    "x-replayed-from-dlq-at": datetime.now(timezone.utc).isoformat(),
+                    "x-replayed-from-dlq-at": datetime.now(UTC).isoformat(),
                     "x-replayed-original-reason": entry.reason,
                 },
             )
@@ -236,11 +257,17 @@ def _has_filters(args: argparse.Namespace) -> bool:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    inspect_parser = subparsers.add_parser("inspect", help="List DLQ contents without changing anything")
-    inspect_parser.add_argument("--limit", type=int, default=None, help="Only inspect the first N messages")
+    inspect_parser = subparsers.add_parser(
+        "inspect", help="List DLQ contents without changing anything"
+    )
+    inspect_parser.add_argument(
+        "--limit", type=int, default=None, help="Only inspect the first N messages"
+    )
     inspect_parser.add_argument("--event-id", default=None)
     inspect_parser.add_argument("--original-queue", default=None)
     inspect_parser.add_argument("--reason-contains", default=None)
@@ -250,11 +277,23 @@ def build_parser() -> argparse.ArgumentParser:
     replay_parser = subparsers.add_parser("replay", help="Replay selected (or all) DLQ messages")
     replay_parser.add_argument("--all", action="store_true", help="Replay every message in the DLQ")
     replay_parser.add_argument("--event-id", default=None, help="Replay only this event_id")
-    replay_parser.add_argument("--original-queue", default=None, help="Replay only messages originally destined for this queue")
-    replay_parser.add_argument("--reason-contains", default=None, help="Replay only messages whose failure reason contains this substring")
+    replay_parser.add_argument(
+        "--original-queue",
+        default=None,
+        help="Replay only messages originally destined for this queue",
+    )
+    replay_parser.add_argument(
+        "--reason-contains",
+        default=None,
+        help="Replay only messages whose failure reason contains this substring",
+    )
     replay_parser.add_argument("--repo", default=None, help="Replay only messages for this repo")
-    replay_parser.add_argument("--limit", type=int, default=None, help="Only consider the first N messages in the DLQ")
-    replay_parser.add_argument("--dry-run", action="store_true", help="Show what would be replayed without doing it")
+    replay_parser.add_argument(
+        "--limit", type=int, default=None, help="Only consider the first N messages in the DLQ"
+    )
+    replay_parser.add_argument(
+        "--dry-run", action="store_true", help="Show what would be replayed without doing it"
+    )
     replay_parser.set_defaults(func=cmd_replay)
 
     return parser

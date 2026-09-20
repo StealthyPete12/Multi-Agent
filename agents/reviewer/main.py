@@ -26,7 +26,7 @@ import contextlib
 import os
 import signal
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import asyncpg
 from opentelemetry.trace import SpanKind
@@ -57,7 +57,9 @@ REVIEWER_METRICS_PORT = int(os.environ.get("REVIEWER_METRICS_PORT", "9103"))
 log = configure_logging(service_name="reviewer")
 
 
-def classify_reviewer_failure(exc: Exception) -> type[RetryableError | PoisonMessageError | FatalError]:
+def classify_reviewer_failure(
+    exc: Exception,
+) -> type[RetryableError | PoisonMessageError | FatalError]:
     """Map a failure from ``process_findings``'s pipeline (Postgres,
     Slack) to one of the three Phase 4 error categories. Kept in the
     consumer, not ``shared/errors.py``, for the same layering reason as
@@ -192,7 +194,8 @@ async def process_findings(
         )
 
     telemetry.get_metrics().review_duration_ms.record(
-        (time.monotonic() - review_started) * 1000, {"repo": findings.repo, "severity": breakdown.severity}
+        (time.monotonic() - review_started) * 1000,
+        {"repo": findings.repo, "severity": breakdown.severity},
     )
 
     return ReviewCompleted(
@@ -204,7 +207,7 @@ async def process_findings(
         score=breakdown.total,
         summary=findings.semantic_summary or narrative[:200],
         total_findings=len(findings.findings),
-        completed_at=datetime.now(timezone.utc),
+        completed_at=datetime.now(UTC),
     )
 
 
@@ -243,20 +246,27 @@ async def handle_message(
 
     attempt = RetryLadder.attempt_from_headers(message.headers)
 
-    with trace_context(trace_id=envelope.trace_id, correlation_id=envelope.event_id), telemetry.consumer_span(
-        "reviewer.handle_findings_ready",
-        message.headers,
-        tracer_name="agents.reviewer",
-        attributes={
-            "messaging.system": "rabbitmq",
-            "messaging.destination.name": QUEUE_FINDINGS,
-            "swarm.repo": envelope.payload.repo,
-            "swarm.commit_sha": envelope.payload.commit_sha,
-            "swarm.retry_count": attempt,
-        },
+    with (
+        trace_context(trace_id=envelope.trace_id, correlation_id=envelope.event_id),
+        telemetry.consumer_span(
+            "reviewer.handle_findings_ready",
+            message.headers,
+            tracer_name="agents.reviewer",
+            attributes={
+                "messaging.system": "rabbitmq",
+                "messaging.destination.name": QUEUE_FINDINGS,
+                "swarm.repo": envelope.payload.repo,
+                "swarm.commit_sha": envelope.payload.commit_sha,
+                "swarm.retry_count": attempt,
+            },
+        ),
     ):
-        telemetry.get_metrics().events_processed.add(1, {"event_type": "findings.ready", "direction": "consumed"})
-        telemetry.get_metrics().findings_events.add(1, {"repo": envelope.payload.repo, "direction": "consumed"})
+        telemetry.get_metrics().events_processed.add(
+            1, {"event_type": "findings.ready", "direction": "consumed"}
+        )
+        telemetry.get_metrics().findings_events.add(
+            1, {"repo": envelope.payload.repo, "direction": "consumed"}
+        )
         log.info(
             "findings.ready received",
             extra={
@@ -308,7 +318,9 @@ async def handle_message(
                 correlation_id=envelope.event_id,
             )
             await broker.publish(review_envelope, routing_key=EventType.REVIEW_COMPLETED.value)
-            telemetry.get_metrics().review_events.add(1, {"repo": review.repo, "severity": review.severity, "direction": "published"})
+            telemetry.get_metrics().review_events.add(
+                1, {"repo": review.repo, "severity": review.severity, "direction": "published"}
+            )
             log.info(
                 "published review.completed",
                 extra={
@@ -427,7 +439,7 @@ async def run() -> None:
             )
             try:
                 await asyncio.wait_for(consume_task, timeout=GRACEFUL_SHUTDOWN_SECONDS)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 log.warning("graceful shutdown window elapsed, cancelling consumer")
                 consume_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):

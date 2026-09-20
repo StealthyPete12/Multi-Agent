@@ -25,7 +25,7 @@ import contextlib
 import os
 import signal
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import asyncpg
 from opentelemetry.trace import SpanKind
@@ -62,7 +62,9 @@ RESEARCHER_METRICS_PORT = int(os.environ.get("RESEARCHER_METRICS_PORT", "9102"))
 log = configure_logging(service_name="researcher")
 
 
-def classify_researcher_failure(exc: Exception) -> type[RetryableError | PoisonMessageError | FatalError]:
+def classify_researcher_failure(
+    exc: Exception,
+) -> type[RetryableError | PoisonMessageError | FatalError]:
     """Map a failure from ``analyze_commit``'s pipeline (repo clone, git,
     Postgres, LLM) to one of the three Phase 4 error categories.
 
@@ -99,7 +101,7 @@ async def analyze_commit(
 ) -> FindingsReady:
     """Run the full clone -> AST -> graph -> store -> blast-radius pipeline
     for one commit and build the `findings.ready` payload."""
-    started_at = datetime.now(timezone.utc)
+    started_at = datetime.now(UTC)
 
     t0 = time.monotonic()
     repo_path = await repo_cache.ensure(payload.repo, payload.commit_sha)
@@ -164,7 +166,7 @@ async def analyze_commit(
         },
     )
 
-    completed_at = datetime.now(timezone.utc)
+    completed_at = datetime.now(UTC)
     return FindingsReady(
         commit_sha=payload.commit_sha,
         agent_name="researcher",
@@ -226,20 +228,27 @@ async def handle_message(
 
     attempt = RetryLadder.attempt_from_headers(message.headers)
 
-    with trace_context(trace_id=envelope.trace_id, correlation_id=envelope.event_id), telemetry.consumer_span(
-        "researcher.handle_commit_detected",
-        message.headers,
-        tracer_name="agents.researcher",
-        attributes={
-            "messaging.system": "rabbitmq",
-            "messaging.destination.name": QUEUE_COMMITS,
-            "swarm.repo": envelope.payload.repo,
-            "swarm.commit_sha": envelope.payload.commit_sha,
-            "swarm.retry_count": attempt,
-        },
+    with (
+        trace_context(trace_id=envelope.trace_id, correlation_id=envelope.event_id),
+        telemetry.consumer_span(
+            "researcher.handle_commit_detected",
+            message.headers,
+            tracer_name="agents.researcher",
+            attributes={
+                "messaging.system": "rabbitmq",
+                "messaging.destination.name": QUEUE_COMMITS,
+                "swarm.repo": envelope.payload.repo,
+                "swarm.commit_sha": envelope.payload.commit_sha,
+                "swarm.retry_count": attempt,
+            },
+        ),
     ):
-        telemetry.get_metrics().events_processed.add(1, {"event_type": "commit.detected", "direction": "consumed"})
-        telemetry.get_metrics().commit_events.add(1, {"repo": envelope.payload.repo, "direction": "consumed"})
+        telemetry.get_metrics().events_processed.add(
+            1, {"event_type": "commit.detected", "direction": "consumed"}
+        )
+        telemetry.get_metrics().commit_events.add(
+            1, {"repo": envelope.payload.repo, "direction": "consumed"}
+        )
         log.info(
             "commit.detected received",
             extra={
@@ -278,7 +287,9 @@ async def handle_message(
                 correlation_id=envelope.event_id,
             )
             await broker.publish(findings_envelope, routing_key=EventType.FINDINGS_READY.value)
-            telemetry.get_metrics().findings_events.add(1, {"repo": findings_payload.repo, "direction": "published"})
+            telemetry.get_metrics().findings_events.add(
+                1, {"repo": findings_payload.repo, "direction": "published"}
+            )
             log.info(
                 "published findings.ready",
                 extra={
@@ -410,7 +421,7 @@ async def run() -> None:
             )
             try:
                 await asyncio.wait_for(consume_task, timeout=GRACEFUL_SHUTDOWN_SECONDS)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 log.warning("graceful shutdown window elapsed, cancelling consumer")
                 consume_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):

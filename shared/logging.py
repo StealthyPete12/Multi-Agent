@@ -21,9 +21,10 @@ import json
 import logging
 import sys
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
+_otel_trace: Any
 try:
     from opentelemetry import trace as _otel_trace
 except ImportError:  # pragma: no cover - opentelemetry is a hard dependency in practice
@@ -43,6 +44,7 @@ def _otel_span_id() -> str | None:
     ctx = _otel_trace.get_current_span().get_span_context()
     return format(ctx.span_id, "016x") if ctx.is_valid else None
 
+
 __all__ = [
     "configure_logging",
     "get_logger",
@@ -53,9 +55,7 @@ __all__ = [
     "get_correlation_id",
 ]
 
-_trace_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    "trace_id", default=None
-)
+_trace_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar("trace_id", default=None)
 _correlation_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "correlation_id", default=None
 )
@@ -100,9 +100,7 @@ class JsonFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         payload: dict[str, Any] = {
-            "timestamp": datetime.fromtimestamp(
-                record.created, tz=timezone.utc
-            ).isoformat(),
+            "timestamp": datetime.fromtimestamp(record.created, tz=UTC).isoformat(),
             "level": record.levelname,
             "severity": record.levelname,
             "service": self.service_name,
@@ -126,9 +124,7 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(payload, default=str, ensure_ascii=False)
 
 
-def configure_logging(
-    service_name: str, level: str | int = "INFO"
-) -> logging.Logger:
+def configure_logging(service_name: str, level: str | int = "INFO") -> logging.Logger:
     """Configure the root logger for JSON-on-stdout output and return a
     logger namespaced to ``service_name``.
 
@@ -193,7 +189,7 @@ class trace_context:
         self._trace_token: contextvars.Token[str | None] | None = None
         self._correlation_token: contextvars.Token[str | None] | None = None
 
-    def __enter__(self) -> "trace_context":
+    def __enter__(self) -> trace_context:
         self._trace_token = _trace_id_var.set(self.trace_id)
         self._correlation_token = _correlation_id_var.set(self.correlation_id)
         return self

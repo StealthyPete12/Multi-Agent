@@ -19,8 +19,8 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime, timezone
-from enum import Enum
+from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Any, ClassVar, Generic, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -41,14 +41,14 @@ __all__ = [
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _new_id() -> str:
     return str(uuid.uuid4())
 
 
-class EventType(str, Enum):
+class EventType(StrEnum):
     """Discriminator carried on every envelope, used for routing keys and
     for picking the correct payload model when deserializing."""
 
@@ -195,7 +195,7 @@ class Envelope(BaseModel, Generic[PayloadT]):
         return self.to_json().encode("utf-8")
 
     @classmethod
-    def from_json(cls, data: str | bytes) -> "Envelope[PayloadT]":
+    def from_json(cls, data: str | bytes) -> Envelope[PayloadT]:
         """Deserialize a JSON string/bytes into this concrete envelope type.
 
         Use on a parametrized alias, e.g.::
@@ -219,7 +219,7 @@ def make_envelope(
     one isn't supplied (e.g. the first hop of a new pipeline run).
     """
 
-    return Envelope[type(payload)](  # type: ignore[valid-type]
+    return Envelope[PayloadT](
         event_type=event_type,
         source=source,
         trace_id=trace_id or _new_id(),

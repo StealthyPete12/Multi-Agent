@@ -14,13 +14,13 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import asyncpg
 import pytest
 
-from agents.reviewer.main import handle_message as reviewer_handle_message
 from agents.researcher.main import handle_message as researcher_handle_message
+from agents.reviewer.main import handle_message as reviewer_handle_message
 from shared.breaker import CircuitState, get_circuit_breaker
 from shared.broker import Broker
 from shared.contracts import CommitDetected, EventType, make_envelope
@@ -32,21 +32,29 @@ from tests.test_researcher_consumer import (
 )
 from tests.test_researcher_consumer import (
     FakeDatabase,
-    FakeMessage as ResearcherFakeMessage,
     FakeRepositoryCache,
-    FakeRetryLadder as ResearcherFakeRetryLadder,
     _sample_commit,
     _write_sample_repo,
 )
+from tests.test_researcher_consumer import FakeIdempotency as ResearcherFakeIdempotency
+from tests.test_researcher_consumer import (
+    FakeMessage as ResearcherFakeMessage,
+)
+from tests.test_researcher_consumer import (
+    FakeRetryLadder as ResearcherFakeRetryLadder,
+)
 from tests.test_reviewer_consumer import (
     FakeLLMClient,
-    FakeMessage as ReviewerFakeMessage,
-    FakeRetryLadder as ReviewerFakeRetryLadder,
     FakeStorage,
     RecordingSlackNotifier,
     _findings,
 )
-from tests.test_researcher_consumer import FakeIdempotency as ResearcherFakeIdempotency
+from tests.test_reviewer_consumer import (
+    FakeMessage as ReviewerFakeMessage,
+)
+from tests.test_reviewer_consumer import (
+    FakeRetryLadder as ReviewerFakeRetryLadder,
+)
 
 DATABASE_URL = "postgresql://swarm:swarm_dev_password@localhost:5432/code_review_swarm"
 
@@ -220,9 +228,24 @@ async def test_scenario_c_retry_ladder_progression_to_dlq(rabbitmq_available):
     broker = Broker(exchange_name=f"chaos.c.exchange.{suffix}")
     await broker.connect()
     fast_ladder = (
-        RetryRung(name="rung1", delay_ms=150, exchange_name=f"chaos.c.r1.{suffix}", queue_name=f"chaos.c.q1.{suffix}"),
-        RetryRung(name="rung2", delay_ms=150, exchange_name=f"chaos.c.r2.{suffix}", queue_name=f"chaos.c.q2.{suffix}"),
-        RetryRung(name="rung3", delay_ms=150, exchange_name=f"chaos.c.r3.{suffix}", queue_name=f"chaos.c.q3.{suffix}"),
+        RetryRung(
+            name="rung1",
+            delay_ms=150,
+            exchange_name=f"chaos.c.r1.{suffix}",
+            queue_name=f"chaos.c.q1.{suffix}",
+        ),
+        RetryRung(
+            name="rung2",
+            delay_ms=150,
+            exchange_name=f"chaos.c.r2.{suffix}",
+            queue_name=f"chaos.c.q2.{suffix}",
+        ),
+        RetryRung(
+            name="rung3",
+            delay_ms=150,
+            exchange_name=f"chaos.c.r3.{suffix}",
+            queue_name=f"chaos.c.q3.{suffix}",
+        ),
     )
     ladder = RetryLadder(broker, ladder=fast_ladder)
     await ladder.declare_topology()
@@ -238,7 +261,7 @@ async def test_scenario_c_retry_ladder_progression_to_dlq(rabbitmq_available):
         branch="main",
         author="chaos",
         message="simulated persistent 429",
-        committed_at=datetime.now(timezone.utc),
+        committed_at=datetime.now(UTC),
         changed_files=[],
     )
     envelope = make_envelope(payload, event_type=EventType.COMMIT_DETECTED, source="chaos-c")
@@ -274,7 +297,9 @@ async def test_scenario_c_retry_ladder_progression_to_dlq(rabbitmq_available):
                 )
             else:
                 await ladder.send_to_dlq(
-                    envelope, reason="simulated 429, retries exhausted", attempt=next_attempt,
+                    envelope,
+                    reason="simulated 429, retries exhausted",
+                    attempt=next_attempt,
                     original_queue=origin_queue_name,
                 )
 
@@ -331,7 +356,9 @@ async def _get_one_matching(queue, body: bytes):
 async def test_scenario_d_malformed_contract_immediate_dlq_no_retries():
     broker = ResearcherFakeBroker()
     retry_ladder = ResearcherFakeRetryLadder()
-    bad_body = b'{"event_type": "commit.detected", "source": "chaos-d", "payload": {"not": "valid"}}'
+    bad_body = (
+        b'{"event_type": "commit.detected", "source": "chaos-d", "payload": {"not": "valid"}}'
+    )
     message = ResearcherFakeMessage(bad_body)
 
     await researcher_handle_message(

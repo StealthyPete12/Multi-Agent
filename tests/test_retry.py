@@ -1,6 +1,6 @@
 import asyncio
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -16,7 +16,7 @@ def _commit_envelope():
         branch="main",
         author="tester",
         message="retry test",
-        committed_at=datetime.now(timezone.utc),
+        committed_at=datetime.now(UTC),
         changed_files=["a.py"],
     )
     return make_envelope(payload, event_type=EventType.COMMIT_DETECTED, source="test")

@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from agents.reviewer.scoring import (
     ScoringConfig,
@@ -11,19 +11,19 @@ from shared.contracts import BlastRadius, FindingsReady
 
 
 def _findings(**overrides) -> FindingsReady:
-    now = datetime.now(timezone.utc)
-    defaults = dict(
-        commit_sha="a" * 40,
-        agent_name="researcher",
-        findings=[],
-        started_at=now,
-        completed_at=now,
-        repo="acme/widgets",
-        changed_files=["tests/test_widget.py"],
-        blast_radius=BlastRadius(impacted_modules=[], impact_count=0, max_depth=0),
-        sensitive_hits=[],
-        semantic_summary="",
-    )
+    now = datetime.now(UTC)
+    defaults = {
+        "commit_sha": "a" * 40,
+        "agent_name": "researcher",
+        "findings": [],
+        "started_at": now,
+        "completed_at": now,
+        "repo": "acme/widgets",
+        "changed_files": ["tests/test_widget.py"],
+        "blast_radius": BlastRadius(impacted_modules=[], impact_count=0, max_depth=0),
+        "sensitive_hits": [],
+        "semantic_summary": "",
+    }
     defaults.update(overrides)
     return FindingsReady(**defaults)
 
@@ -102,7 +102,9 @@ def test_multiple_sensitive_hits_score_higher_than_one():
     one_hit = _findings(sensitive_hits=["auth/login.py"])
     two_hits = _findings(sensitive_hits=["auth/login.py", "payments/charge.py"])
 
-    assert compute_score(two_hits).sensitive_hits_points > compute_score(one_hit).sensitive_hits_points
+    assert (
+        compute_score(two_hits).sensitive_hits_points > compute_score(one_hit).sensitive_hits_points
+    )
 
 
 def test_no_test_proximity_adds_penalty():

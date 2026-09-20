@@ -70,10 +70,10 @@ return {allowed, tostring(tokens), wait_ms}
 DEFAULT_TOKENS_PER_MINUTE = int(os.environ.get("RATE_LIMIT_TOKENS_PER_MINUTE", "60"))
 DEFAULT_MAX_WAIT_SECONDS = float(os.environ.get("RATE_LIMIT_MAX_WAIT_SECONDS", "60"))
 
-_redis_client: "redis.Redis | None" = None
+_redis_client: redis.Redis | None = None
 
 
-def get_redis_client() -> "redis.Redis":
+def get_redis_client() -> redis.Redis:
     """Process-wide Redis client, built from ``REDIS_URL``. Reused across
     callers rather than opening a new connection per rate-limit check."""
     global _redis_client
@@ -97,7 +97,7 @@ class RateLimiter:
 
     def __init__(
         self,
-        client: "redis.Redis",
+        client: redis.Redis,
         *,
         tokens_per_minute: int,
         capacity: int | None = None,

@@ -11,13 +11,13 @@ from shared.llm import AnthropicClient, LLMError
 
 
 def _fast_client(**overrides) -> AnthropicClient:
-    kwargs = dict(
-        api_key="sk-test",
-        model="retry-test-model",
-        rate_limit_enabled=False,
-        retry_backoff_seconds=0.001,
-        retry_backoff_max_seconds=0.01,
-    )
+    kwargs = {
+        "api_key": "sk-test",
+        "model": "retry-test-model",
+        "rate_limit_enabled": False,
+        "retry_backoff_seconds": 0.001,
+        "retry_backoff_max_seconds": 0.01,
+    }
     kwargs.update(overrides)
     return AnthropicClient(**kwargs)
 
@@ -83,9 +83,7 @@ async def test_backoff_delay_grows_and_is_capped():
 async def test_circuit_breaker_opens_after_repeated_llm_failures(httpx_mock):
     for _ in range(5):
         httpx_mock.add_response(url="https://api.anthropic.com/v1/messages", status_code=503)
-    client = _fast_client(
-        max_retries=0, breaker_failure_threshold=5, breaker_open_seconds=60
-    )
+    client = _fast_client(max_retries=0, breaker_failure_threshold=5, breaker_open_seconds=60)
     for _ in range(5):
         with pytest.raises(LLMError):
             await client.complete(system="s", prompt="p", max_tokens=10)

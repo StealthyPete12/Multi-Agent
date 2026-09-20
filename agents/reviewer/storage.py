@@ -24,7 +24,7 @@ from dataclasses import dataclass
 import asyncpg
 from opentelemetry.trace import SpanKind
 
-from agents.reviewer.scoring import ScoreBreakdown, Severity
+from agents.reviewer.scoring import ScoreBreakdown
 from shared import telemetry
 from shared.contracts import FindingsReady
 from shared.logging import configure_logging
@@ -174,7 +174,9 @@ class ReviewStorage:
             duration_ms = (time.monotonic() - started) * 1000
             current_span.set_attribute("swarm.duration_ms", duration_ms)
             current_span.set_attribute("swarm.report_id", str(row["id"]))
-            telemetry.get_metrics().db_write_duration_ms.record(duration_ms, {"table": "reports", "operation": "save_report"})
+            telemetry.get_metrics().db_write_duration_ms.record(
+                duration_ms, {"table": "reports", "operation": "save_report"}
+            )
             log.info(
                 "report persisted",
                 extra={
@@ -189,7 +191,7 @@ class ReviewStorage:
             )
             return SavedReport(report_id=str(row["id"]), status=status)
 
-    async def __aenter__(self) -> "ReviewStorage":
+    async def __aenter__(self) -> ReviewStorage:
         await self.connect()
         return self
 

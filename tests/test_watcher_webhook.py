@@ -67,9 +67,7 @@ def client(monkeypatch):
 
 
 def test_rejects_missing_signature(client):
-    resp = client.post(
-        "/webhook/github", content=_push_body(), headers={"X-GitHub-Event": "push"}
-    )
+    resp = client.post("/webhook/github", content=_push_body(), headers={"X-GitHub-Event": "push"})
     assert resp.status_code == 401
 
 

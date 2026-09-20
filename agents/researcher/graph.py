@@ -135,9 +135,7 @@ def _resolve_absolute(target: str, graph: DependencyGraph) -> tuple[str, bool]:
     return target, True
 
 
-def _resolve_from_target(
-    base: str, name: str, graph: DependencyGraph
-) -> tuple[str, bool]:
+def _resolve_from_target(base: str, name: str, graph: DependencyGraph) -> tuple[str, bool]:
     """Resolve one alias of ``from base import name``.
 
     Tries the submodule first (``base.name``), then falls back to ``base``
@@ -182,7 +180,9 @@ def build_dependency_graph(repo_root: Path) -> DependencyGraph:
     for file in py_files:
         rel = file.relative_to(repo_root)
         name, is_package = _module_name_for(rel)
-        graph.add_module(ModuleInfo(name=name, path=str(rel).replace("\\", "/"), is_package=is_package))
+        graph.add_module(
+            ModuleInfo(name=name, path=str(rel).replace("\\", "/"), is_package=is_package)
+        )
 
     for file in py_files:
         rel = file.relative_to(repo_root)
@@ -210,7 +210,9 @@ def build_dependency_graph(repo_root: Path) -> DependencyGraph:
                     for alias in node.names:
                         resolved, is_external = _resolve_from_target(base, alias.name, graph)
                         graph.add_edge(
-                            ImportEdge(importer_name, resolved, "relative", node.lineno, is_external)
+                            ImportEdge(
+                                importer_name, resolved, "relative", node.lineno, is_external
+                            )
                         )
                 else:
                     module = node.module or ""

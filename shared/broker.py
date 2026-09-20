@@ -74,9 +74,7 @@ class Broker:
         self.url = url or os.environ.get(
             "RABBITMQ_URL", "amqp://swarm:swarm_dev_password@localhost:5672/"
         )
-        self.exchange_name = exchange_name or os.environ.get(
-            "RABBITMQ_EXCHANGE", DEFAULT_EXCHANGE
-        )
+        self.exchange_name = exchange_name or os.environ.get("RABBITMQ_EXCHANGE", DEFAULT_EXCHANGE)
         self.dlx_name = f"{self.exchange_name}.dlx"
         self.prefetch_count = prefetch_count or int(
             os.environ.get("RABBITMQ_PREFETCH", DEFAULT_PREFETCH)
@@ -125,20 +123,20 @@ class Broker:
             self._dlx = None
 
     @property
-    def channel(self) -> "AbstractChannel":
+    def channel(self) -> AbstractChannel:
         if self._channel is None:
             raise RuntimeError("Broker.connect() must be awaited before use")
         return self._channel
 
     @property
-    def exchange(self) -> "aio_pika.abc.AbstractExchange":
+    def exchange(self) -> aio_pika.abc.AbstractExchange:
         if self._exchange is None:
             raise RuntimeError("Broker.connect() must be awaited before use")
         return self._exchange
 
     async def publish(
         self,
-        envelope: "Envelope",
+        envelope: Envelope,
         *,
         routing_key: str,
     ) -> None:
@@ -186,7 +184,7 @@ class Broker:
         queue_name: str,
         *,
         routing_keys: list[str],
-    ) -> "AbstractQueue":
+    ) -> AbstractQueue:
         """Declare a durable queue bound to the main exchange for each of
         ``routing_keys``, dead-lettering to ``<queue_name>.dlq`` on the DLX.
 
@@ -210,12 +208,12 @@ class Broker:
 
         return queue
 
-    def _dlx_exchange(self) -> "aio_pika.abc.AbstractExchange":
+    def _dlx_exchange(self) -> aio_pika.abc.AbstractExchange:
         if self._dlx is None:
             raise RuntimeError("Broker.connect() must be awaited before use")
         return self._dlx
 
-    async def __aenter__(self) -> "Broker":
+    async def __aenter__(self) -> Broker:
         await self.connect()
         return self
 

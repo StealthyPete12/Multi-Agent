@@ -83,9 +83,7 @@ class RepositoryCache:
             return True
         return (time.time() - marker.stat().st_mtime) > self.stale_after_seconds
 
-    async def ensure(
-        self, repo: str, commit_sha: str, *, clone_url: str | None = None
-    ) -> Path:
+    async def ensure(self, repo: str, commit_sha: str, *, clone_url: str | None = None) -> Path:
         """Return a local checkout of ``repo`` at ``commit_sha``, cloning or
         refreshing as needed. Reuses an existing clone whenever possible."""
         path = self.local_path(repo)
@@ -98,13 +96,22 @@ class RepositoryCache:
             attributes={"swarm.repo": repo, "swarm.commit_sha": commit_sha},
         ):
             if self.is_cached(repo):
-                log.info("repository cache hit", extra={"repo": repo, "path": str(path), "event_type": "repository.cache_hit"})
+                log.info(
+                    "repository cache hit",
+                    extra={"repo": repo, "path": str(path), "event_type": "repository.cache_hit"},
+                )
                 telemetry.get_metrics().repo_cache_hits.add(1, {"repo": repo})
                 if self.is_stale(repo):
-                    log.info("repository cache stale, refreshing", extra={"repo": repo, "event_type": "repository.refresh"})
+                    log.info(
+                        "repository cache stale, refreshing",
+                        extra={"repo": repo, "event_type": "repository.refresh"},
+                    )
                     await self._fetch(path)
             else:
-                log.info("repository cache miss, cloning", extra={"repo": repo, "url": url, "event_type": "repository.cache_miss"})
+                log.info(
+                    "repository cache miss, cloning",
+                    extra={"repo": repo, "url": url, "event_type": "repository.cache_miss"},
+                )
                 await self._clone(url, path)
 
             try:
@@ -112,7 +119,11 @@ class RepositoryCache:
             except CommitNotFoundError:
                 log.info(
                     "commit not in local history, unshallowing",
-                    extra={"repo": repo, "commit_sha": commit_sha, "event_type": "repository.unshallow"},
+                    extra={
+                        "repo": repo,
+                        "commit_sha": commit_sha,
+                        "event_type": "repository.unshallow",
+                    },
                 )
                 await self._fetch(path, unshallow=True)
                 await self._checkout(path, commit_sha)
@@ -131,13 +142,18 @@ class RepositoryCache:
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await process.communicate()
-        return process.returncode or 0, stdout.decode("utf-8", errors="replace"), stderr.decode(
-            "utf-8", errors="replace"
+        return (
+            process.returncode or 0,
+            stdout.decode("utf-8", errors="replace"),
+            stderr.decode("utf-8", errors="replace"),
         )
 
     async def _clone(self, url: str, path: Path) -> None:
         with telemetry.span(
-            "repository.clone", kind=SpanKind.INTERNAL, tracer_name="agents.researcher", attributes={"swarm.url": url}
+            "repository.clone",
+            kind=SpanKind.INTERNAL,
+            tracer_name="agents.researcher",
+            attributes={"swarm.url": url},
         ) as current_span:
             path.parent.mkdir(parents=True, exist_ok=True)
             started = time.monotonic()
@@ -188,7 +204,9 @@ class RepositoryCache:
                     "event_type": "repository.refresh",
                 },
             )
-            telemetry.get_metrics().repo_refresh_duration_ms.record(duration_ms, {"unshallow": str(unshallow)})
+            telemetry.get_metrics().repo_refresh_duration_ms.record(
+                duration_ms, {"unshallow": str(unshallow)}
+            )
 
     async def _checkout(self, path: Path, commit_sha: str) -> None:
         started = time.monotonic()

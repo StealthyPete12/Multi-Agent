@@ -22,7 +22,7 @@ import random
 import string
 import sys
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from shared.broker import Broker
 from shared.contracts import CommitDetected, EventType, make_envelope
@@ -63,7 +63,7 @@ def _random_commit(branch: str) -> CommitDetected:
         branch=branch,
         author=f"{random.choice(_WORDS)}@acme.dev",
         message=subject,
-        committed_at=datetime.now(timezone.utc),
+        committed_at=datetime.now(UTC),
         changed_files=changed_files,
     )
 
@@ -73,9 +73,7 @@ def build_commit(args: argparse.Namespace) -> CommitDetected:
         return _random_commit(args.branch)
 
     if not args.repo or not args.author or not args.message:
-        raise SystemExit(
-            "--repo, --author, and --message are required unless --random is set"
-        )
+        raise SystemExit("--repo, --author, and --message are required unless --random is set")
 
     return CommitDetected(
         repo=args.repo,
@@ -83,7 +81,7 @@ def build_commit(args: argparse.Namespace) -> CommitDetected:
         branch=args.branch,
         author=args.author,
         message=args.message,
-        committed_at=datetime.now(timezone.utc),
+        committed_at=datetime.now(UTC),
         changed_files=args.changed_files.split(",") if args.changed_files else [],
     )
 
@@ -101,9 +99,7 @@ async def seed(args: argparse.Namespace) -> None:
                 source="seed_commit",
                 trace_id=trace_id,
             )
-            await broker.publish(
-                envelope, routing_key=EventType.COMMIT_DETECTED.value
-            )
+            await broker.publish(envelope, routing_key=EventType.COMMIT_DETECTED.value)
             log.info(
                 "seeded commit.detected",
                 extra={
@@ -125,13 +121,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sha", help="commit SHA (default: random)")
     parser.add_argument("--author", help="commit author")
     parser.add_argument("--message", help="commit message")
-    parser.add_argument(
-        "--changed-files", help="comma-separated list of changed file paths"
-    )
+    parser.add_argument("--changed-files", help="comma-separated list of changed file paths")
     parser.add_argument("--trace-id", help="trace ID to attach (default: random per event)")
-    parser.add_argument(
-        "--random", action="store_true", help="generate a random synthetic commit"
-    )
+    parser.add_argument("--random", action="store_true", help="generate a random synthetic commit")
     parser.add_argument(
         "--count", type=int, default=1, help="number of events to publish (default: 1)"
     )

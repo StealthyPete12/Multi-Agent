@@ -60,7 +60,9 @@ async def test_mark_complete_then_claim_is_permanently_blocked(pool, event_id):
     # be reclaimed — that would mean redoing already-finished, possibly
     # side-effecting work (duplicate Slack message, duplicate report).
     store_impatient = IdempotencyStore(pool, stale_after_seconds=0)
-    reclaimed = await store_impatient.claim(event_id=event_id, event_type="test.event", trace_id=None)
+    reclaimed = await store_impatient.claim(
+        event_id=event_id, event_type="test.event", trace_id=None
+    )
     assert reclaimed is False
 
 
@@ -84,7 +86,9 @@ async def test_abandoned_claim_is_reclaimed_after_staleness_window(pool, event_i
     await asyncio.sleep(0.3)  # past the 0.2s staleness window
 
     restarted_worker = IdempotencyStore(pool, stale_after_seconds=0.2)
-    reclaimed = await restarted_worker.claim(event_id=event_id, event_type="test.event", trace_id=None)
+    reclaimed = await restarted_worker.claim(
+        event_id=event_id, event_type="test.event", trace_id=None
+    )
     assert reclaimed is True
     await restarted_worker.mark_complete(event_id)
     assert await restarted_worker.is_completed(event_id) is True

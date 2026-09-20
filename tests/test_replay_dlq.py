@@ -1,6 +1,6 @@
 import argparse
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -39,7 +39,7 @@ def _envelope_bytes(repo="acme/widgets", commit_sha="deadbeef") -> bytes:
         branch="main",
         author="tester",
         message="x",
-        committed_at=datetime.now(timezone.utc),
+        committed_at=datetime.now(UTC),
         changed_files=[],
     )
     envelope = make_envelope(payload, event_type=EventType.COMMIT_DETECTED, source="test")
@@ -80,15 +80,22 @@ def test_dlq_entry_handles_unparseable_body_gracefully():
 
 
 def _args(**overrides):
-    defaults = dict(event_id=None, original_queue=None, reason_contains=None, repo=None)
+    defaults = {"event_id": None, "original_queue": None, "reason_contains": None, "repo": None}
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
 
 
 def test_matches_filters_by_event_id():
     entry = DlqEntry(
-        message=None, event_id="abc", event_type="commit.detected", repo="r", commit_sha="s",
-        attempt=1, reason="boom", original_queue="q.commits", first_failed_at=None,
+        message=None,
+        event_id="abc",
+        event_type="commit.detected",
+        repo="r",
+        commit_sha="s",
+        attempt=1,
+        reason="boom",
+        original_queue="q.commits",
+        first_failed_at=None,
     )
     assert _matches(entry, _args(event_id="abc")) is True
     assert _matches(entry, _args(event_id="other")) is False
@@ -96,8 +103,15 @@ def test_matches_filters_by_event_id():
 
 def test_matches_filters_by_reason_substring_case_insensitive():
     entry = DlqEntry(
-        message=None, event_id="abc", event_type="commit.detected", repo="r", commit_sha="s",
-        attempt=1, reason="Connection RESET by peer", original_queue="q.commits", first_failed_at=None,
+        message=None,
+        event_id="abc",
+        event_type="commit.detected",
+        repo="r",
+        commit_sha="s",
+        attempt=1,
+        reason="Connection RESET by peer",
+        original_queue="q.commits",
+        first_failed_at=None,
     )
     assert _matches(entry, _args(reason_contains="connection reset")) is True
     assert _matches(entry, _args(reason_contains="timeout")) is False
@@ -105,8 +119,15 @@ def test_matches_filters_by_reason_substring_case_insensitive():
 
 def test_matches_with_no_filters_matches_everything():
     entry = DlqEntry(
-        message=None, event_id="abc", event_type="commit.detected", repo="r", commit_sha="s",
-        attempt=1, reason="x", original_queue="q.commits", first_failed_at=None,
+        message=None,
+        event_id="abc",
+        event_type="commit.detected",
+        repo="r",
+        commit_sha="s",
+        attempt=1,
+        reason="x",
+        original_queue="q.commits",
+        first_failed_at=None,
     )
     assert _matches(entry, _args()) is True
 
@@ -129,8 +150,12 @@ async def test_drain_and_finish_round_trip_preserves_unremoved_messages(rabbitmq
     envelope_a = parse_envelope(body_a)
     envelope_b = parse_envelope(body_b)
 
-    await ladder.send_to_dlq(envelope_a, reason=f"test-{marker}", attempt=4, original_queue="q.commits")
-    await ladder.send_to_dlq(envelope_b, reason=f"test-{marker}", attempt=4, original_queue="q.commits")
+    await ladder.send_to_dlq(
+        envelope_a, reason=f"test-{marker}", attempt=4, original_queue="q.commits"
+    )
+    await ladder.send_to_dlq(
+        envelope_b, reason=f"test-{marker}", attempt=4, original_queue="q.commits"
+    )
 
     try:
         # Inspect-style drain: find our two, requeue everything (including

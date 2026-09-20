@@ -25,7 +25,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException, Request, Response
+from fastapi import FastAPI, Header, HTTPException, Request
 from opentelemetry.trace import SpanKind
 from prometheus_client import make_asgi_app
 
@@ -36,9 +36,7 @@ from shared.logging import configure_logging, trace_context
 
 GITHUB_WEBHOOK_SECRET = os.environ.get("GITHUB_WEBHOOK_SECRET", "")
 WATCHED_BRANCHES = [
-    b.strip()
-    for b in os.environ.get("WATCHED_BRANCHES", "main").split(",")
-    if b.strip()
+    b.strip() for b in os.environ.get("WATCHED_BRANCHES", "main").split(",") if b.strip()
 ]
 QUEUE_COMMITS = os.environ.get("QUEUE_COMMITS", "q.commits")
 
@@ -77,9 +75,7 @@ def branch_from_ref(ref: str) -> str:
     return ref[len(prefix) :] if ref.startswith(prefix) else ref
 
 
-def extract_commit_events(
-    payload: dict[str, Any], *, trace_id: str
-) -> list[CommitDetected]:
+def extract_commit_events(payload: dict[str, Any], *, trace_id: str) -> list[CommitDetected]:
     """Build one :class:`CommitDetected` per commit in a GitHub push payload.
 
     Returns an empty list if the payload has no commits (e.g. a branch
@@ -114,9 +110,7 @@ async def lifespan(app: FastAPI):
     telemetry.init_telemetry("watcher", start_metrics_server=False)
     broker = Broker()
     await broker.connect()
-    await broker.declare_queue(
-        QUEUE_COMMITS, routing_keys=[EventType.COMMIT_DETECTED.value]
-    )
+    await broker.declare_queue(QUEUE_COMMITS, routing_keys=[EventType.COMMIT_DETECTED.value])
     app.state.broker = broker
     log.info(
         "watcher started",
@@ -169,16 +163,19 @@ async def github_webhook(
     trace_id = str(uuid.uuid4())
     compare_url = payload.get("compare")
 
-    with trace_context(trace_id=trace_id), telemetry.span(
-        "watcher.webhook_received",
-        kind=SpanKind.SERVER,
-        tracer_name="agents.watcher",
-        attributes={
-            "http.method": "POST",
-            "http.route": "/webhook/github",
-            "swarm.branch": branch,
-            "swarm.trace_id": trace_id,
-        },
+    with (
+        trace_context(trace_id=trace_id),
+        telemetry.span(
+            "watcher.webhook_received",
+            kind=SpanKind.SERVER,
+            tracer_name="agents.watcher",
+            attributes={
+                "http.method": "POST",
+                "http.route": "/webhook/github",
+                "swarm.branch": branch,
+                "swarm.trace_id": trace_id,
+            },
+        ),
     ):
         commit_events = extract_commit_events(payload, trace_id=trace_id)
 
@@ -193,7 +190,9 @@ async def github_webhook(
             )
             await broker.publish(envelope, routing_key=EventType.COMMIT_DETECTED.value)
             published.append(envelope.event_id)
-            telemetry.get_metrics().commit_events.add(1, {"repo": commit_payload.repo, "direction": "published"})
+            telemetry.get_metrics().commit_events.add(
+                1, {"repo": commit_payload.repo, "direction": "published"}
+            )
             log.info(
                 "published commit.detected",
                 extra={

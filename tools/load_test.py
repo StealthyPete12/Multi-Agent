@@ -29,7 +29,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import asyncpg
@@ -71,10 +71,14 @@ def build_fixture_repo(repo_dir: Path, *, count: int) -> tuple[str, list[str]]:
         (repo_dir / "database.py").write_text("def connect():\n    return 'db'\n")
         (repo_dir / "auth").mkdir(exist_ok=True)
         (repo_dir / "auth" / "__init__.py").write_text("")
-        (repo_dir / "auth" / "login.py").write_text("import database\n\ndef login(u):\n    database.connect()\n")
+        (repo_dir / "auth" / "login.py").write_text(
+            "import database\n\ndef login(u):\n    database.connect()\n"
+        )
         (repo_dir / "src").mkdir(exist_ok=True)
         (repo_dir / "src" / "__init__.py").write_text("")
-        (repo_dir / "src" / "app.py").write_text("from auth import login\n\ndef handle(u):\n    return login.login(u)\n")
+        (repo_dir / "src" / "app.py").write_text(
+            "from auth import login\n\ndef handle(u):\n    return login.login(u)\n"
+        )
         _run_git("add", "-A", cwd=repo_dir)
         _run_git("commit", "-q", "-m", "initial commit", cwd=repo_dir)
 
@@ -84,7 +88,9 @@ def build_fixture_repo(repo_dir: Path, *, count: int) -> tuple[str, list[str]]:
         marker_file.write_text(f"# load test commit {i}\nimport database\n")
         _run_git("add", "-A", cwd=repo_dir)
         _run_git("commit", "-q", "-m", f"load test commit {i}", cwd=repo_dir)
-        result = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo_dir, capture_output=True, text=True)
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo_dir, capture_output=True, text=True
+        )
         shas.append(result.stdout.strip())
 
     return str(repo_dir), shas
@@ -125,19 +131,25 @@ async def publish_commits(repo_slug: str, shas: list[str]) -> LoadTestResult:
                 branch="main",
                 author="loadtest@swarm.test",
                 message=f"load test commit {i}",
-                committed_at=datetime.now(timezone.utc),
+                committed_at=datetime.now(UTC),
                 changed_files=[f"src/change_{i}.py", "database.py"],
             )
-            envelope = make_envelope(payload, event_type=EventType.COMMIT_DETECTED, source="load_test")
+            envelope = make_envelope(
+                payload, event_type=EventType.COMMIT_DETECTED, source="load_test"
+            )
             published_at = time.monotonic()
             await broker.publish(envelope, routing_key=EventType.COMMIT_DETECTED.value)
-            result.samples.append(Sample(commit_sha=sha, published_at=published_at, published_wall=datetime.now(timezone.utc)))
+            result.samples.append(
+                Sample(commit_sha=sha, published_at=published_at, published_wall=datetime.now(UTC))
+            )
     finally:
         await broker.close()
     return result
 
 
-async def wait_for_completion(repo_slug: str, result: LoadTestResult, *, timeout_seconds: float) -> None:
+async def wait_for_completion(
+    repo_slug: str, result: LoadTestResult, *, timeout_seconds: float
+) -> None:
     pool = await asyncpg.create_pool(DEFAULT_DATABASE_URL, min_size=1, max_size=5)
     pending = {s.commit_sha: s for s in result.samples}
     deadline = time.monotonic() + timeout_seconds
@@ -225,14 +237,19 @@ async def run(args: argparse.Namespace) -> str:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--count", type=int, default=100, help="number of synthetic commits (default: 100)")
+    parser.add_argument(
+        "--count", type=int, default=100, help="number of synthetic commits (default: 100)"
+    )
     parser.add_argument(
         "--repo-dir",
         default="/tmp/swarm-loadtest-fixture",
         help="local git fixture repo directory (created/reused)",
     )
     parser.add_argument(
-        "--timeout", type=float, default=180.0, help="max seconds to wait for completions (default: 180)"
+        "--timeout",
+        type=float,
+        default=180.0,
+        help="max seconds to wait for completions (default: 180)",
     )
     parser.add_argument("--report-out", help="write the markdown report to this path")
     return parser.parse_args(argv)

@@ -34,7 +34,9 @@ def test_prometheus_config_is_valid_yaml_with_expected_jobs():
 
 
 def test_grafana_datasource_config_points_at_prometheus():
-    datasource_path = OBSERVABILITY_DIR / "grafana" / "provisioning" / "datasources" / "datasources.yml"
+    datasource_path = (
+        OBSERVABILITY_DIR / "grafana" / "provisioning" / "datasources" / "datasources.yml"
+    )
     config = yaml.safe_load(datasource_path.read_text())
 
     datasources = config["datasources"]
@@ -90,11 +92,18 @@ def test_dashboard_panel_metrics_match_shared_telemetry_catalog():
 
     # Prometheus appends a unit suffix for a few OTel units used here.
     unit_suffixes = {"ms": "_milliseconds", "s": "_seconds"}
-    unit_by_name = dict(re.findall(r'(?:m|meter)\.create_\w+\(\s*"(\w+)",\s*\n?\s*unit="(\w+)"', telemetry_source))
+    unit_by_name = dict(
+        re.findall(r'(?:m|meter)\.create_\w+\(\s*"(\w+)",\s*\n?\s*unit="(\w+)"', telemetry_source)
+    )
 
     def exposed_names(base: str) -> set[str]:
         suffix = unit_suffixes.get(unit_by_name.get(base, ""), "")
-        return {base + suffix, base + suffix + "_bucket", base + suffix + "_sum", base + suffix + "_count"}
+        return {
+            base + suffix,
+            base + suffix + "_bucket",
+            base + suffix + "_sum",
+            base + suffix + "_count",
+        }
 
     all_exposed = {"up"}  # Prometheus's own synthetic metric
     for name in registered_names:

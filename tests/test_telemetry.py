@@ -196,8 +196,12 @@ def test_multi_hop_propagation_stays_on_one_trace(local_tracing):
 
 
 def test_metrics_counter_increments_are_visible(local_metrics):
-    telemetry.get_metrics().llm_calls.add(1, {"provider": "anthropic", "model": "x", "outcome": "success"})
-    telemetry.get_metrics().llm_calls.add(2, {"provider": "anthropic", "model": "x", "outcome": "success"})
+    telemetry.get_metrics().llm_calls.add(
+        1, {"provider": "anthropic", "model": "x", "outcome": "success"}
+    )
+    telemetry.get_metrics().llm_calls.add(
+        2, {"provider": "anthropic", "model": "x", "outcome": "success"}
+    )
 
     points = _all_metric_points(local_metrics)
     matching = [p for p in points if p["name"] == "swarm_llm_calls_total"]
@@ -261,7 +265,11 @@ def test_register_pool_gauges_reports_size_idle_in_use(local_metrics):
     telemetry.register_pool_gauges("researcher", lambda: FakePool())
 
     points = _all_metric_points(local_metrics)
-    matching = {p["attributes"]["state"]: p["value"] for p in points if p["name"] == "swarm_db_pool_connections"}
+    matching = {
+        p["attributes"]["state"]: p["value"]
+        for p in points
+        if p["name"] == "swarm_db_pool_connections"
+    }
     assert matching == {"total": 5, "idle": 2, "in_use": 3}
 
 
@@ -271,7 +279,9 @@ def test_register_pool_gauges_reports_size_idle_in_use(local_metrics):
 
 
 def test_estimate_cost_usd_known_model():
-    cost = telemetry.estimate_cost_usd("anthropic", "claude-haiku-4-5-20251001", 1_000_000, 1_000_000)
+    cost = telemetry.estimate_cost_usd(
+        "anthropic", "claude-haiku-4-5-20251001", 1_000_000, 1_000_000
+    )
     assert cost == pytest.approx(1.00 + 5.00)
 
 

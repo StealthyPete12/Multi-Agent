@@ -90,9 +90,7 @@ def test_changed_files_to_modules_maps_paths_and_skips_unknown(tmp_path):
     _chain_repo(tmp_path)
     graph = build_dependency_graph(tmp_path)
 
-    modules = changed_files_to_modules(
-        graph, ["database.py", "not_in_repo.py", "README.md"]
-    )
+    modules = changed_files_to_modules(graph, ["database.py", "not_in_repo.py", "README.md"])
 
     assert modules == ["database"]
 

@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -14,7 +14,7 @@ def _sample_payload() -> CommitDetected:
         branch="main",
         author="jane",
         message="test commit",
-        committed_at=datetime.now(timezone.utc),
+        committed_at=datetime.now(UTC),
     )
 
 
@@ -48,9 +48,7 @@ async def test_publish_and_consume_roundtrip(rabbitmq_available):
         )
 
         payload = _sample_payload()
-        envelope = make_envelope(
-            payload, event_type=EventType.COMMIT_DETECTED, source="test"
-        )
+        envelope = make_envelope(payload, event_type=EventType.COMMIT_DETECTED, source="test")
         await broker.publish(envelope, routing_key=EventType.COMMIT_DETECTED.value)
 
         received: Envelope[CommitDetected] | None = None
@@ -83,9 +81,7 @@ async def test_message_survives_connection_cycle(rabbitmq_available):
         queue_name, routing_keys=[EventType.COMMIT_DETECTED.value]
     )
     payload = _sample_payload()
-    envelope = make_envelope(
-        payload, event_type=EventType.COMMIT_DETECTED, source="test"
-    )
+    envelope = make_envelope(payload, event_type=EventType.COMMIT_DETECTED, source="test")
     await publisher.publish(envelope, routing_key=EventType.COMMIT_DETECTED.value)
     await publisher.close()
 

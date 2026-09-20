@@ -22,7 +22,7 @@ import argparse
 import asyncio
 import sys
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from shared.broker import Broker
 from shared.contracts import BlastRadius, EventType, FindingsReady, make_envelope
@@ -32,7 +32,7 @@ log = configure_logging(service_name="seed_findings")
 
 
 def build_findings(args: argparse.Namespace) -> FindingsReady:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     changed_files = args.changed_files.split(",") if args.changed_files else ["src/widget.py"]
     impacted_modules = args.impacted_modules.split(",") if args.impacted_modules else []
     sensitive_hits = args.sensitive_hits.split(",") if args.sensitive_hits else []

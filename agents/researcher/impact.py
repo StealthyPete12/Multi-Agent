@@ -16,7 +16,12 @@ from dataclasses import dataclass, field
 
 from agents.researcher.graph import DependencyGraph
 
-__all__ = ["BlastRadiusResult", "DEFAULT_MAX_DEPTH", "changed_files_to_modules", "compute_blast_radius"]
+__all__ = [
+    "BlastRadiusResult",
+    "DEFAULT_MAX_DEPTH",
+    "changed_files_to_modules",
+    "compute_blast_radius",
+]
 
 DEFAULT_MAX_DEPTH = int(os.environ.get("BLAST_RADIUS_MAX_DEPTH", 10))
 

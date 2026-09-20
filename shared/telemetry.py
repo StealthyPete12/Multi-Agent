@@ -37,10 +37,10 @@ from __future__ import annotations
 
 import os
 import threading
-import time
+from collections.abc import Callable, Iterator, Mapping, MutableMapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Callable, Iterator, Mapping, MutableMapping
+from typing import Protocol
 
 from opentelemetry import metrics, trace
 from opentelemetry.baggage.propagation import W3CBaggagePropagator
@@ -55,6 +55,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
 from opentelemetry.trace import Span, SpanKind, Status, StatusCode
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+from opentelemetry.util.types import Attributes
 
 __all__ = [
     "init_telemetry",
@@ -84,7 +85,7 @@ _init_lock = threading.Lock()
 _tracer_provider_ready = False
 _meter_provider_ready = False
 _metrics_http_server_started = False
-_metrics_singleton: "Metrics | None" = None
+_metrics_singleton: Metrics | None = None
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -160,7 +161,9 @@ def _build_metric_readers(metrics_port: int | None, start_metrics_server: bool) 
     if start_metrics_server and not _metrics_http_server_started:
         from prometheus_client import start_http_server
 
-        port = metrics_port or int(os.environ.get("OTEL_EXPORTER_PROMETHEUS_PORT", _DEFAULT_PROMETHEUS_PORT))
+        port = metrics_port or int(
+            os.environ.get("OTEL_EXPORTER_PROMETHEUS_PORT", _DEFAULT_PROMETHEUS_PORT)
+        )
         host = os.environ.get("OTEL_EXPORTER_PROMETHEUS_HOST", "0.0.0.0")
         start_http_server(port=port, addr=host)
         _metrics_http_server_started = True
@@ -199,8 +202,8 @@ def init_telemetry(
 
         if not _meter_provider_ready:
             readers = _build_metric_readers(metrics_port, start_metrics_server)
-            provider = MeterProvider(resource=resource, metric_readers=readers)
-            metrics.set_meter_provider(provider)
+            meter_provider = MeterProvider(resource=resource, metric_readers=readers)
+            metrics.set_meter_provider(meter_provider)
             _meter_provider_ready = True
 
     tracer = trace.get_tracer(service_name)
@@ -247,27 +250,37 @@ class Metrics:
         m = self.meter
         # Event/pipeline throughput
         self.events_processed = m.create_counter(
-            "swarm_events_processed_total", unit="1", description="Envelopes published or consumed, by event_type/direction"
+            "swarm_events_processed_total",
+            unit="1",
+            description="Envelopes published or consumed, by event_type/direction",
         )
         self.commit_events = m.create_counter(
             "swarm_commit_events_total", unit="1", description="commit.detected events received"
         )
         self.findings_events = m.create_counter(
-            "swarm_findings_events_total", unit="1", description="findings.ready events received/published"
+            "swarm_findings_events_total",
+            unit="1",
+            description="findings.ready events received/published",
         )
         self.review_events = m.create_counter(
             "swarm_review_events_total", unit="1", description="review.completed events published"
         )
         # Fault tolerance
-        self.dlq_count = m.create_counter("swarm_dlq_total", unit="1", description="Messages routed to q.dlq")
+        self.dlq_count = m.create_counter(
+            "swarm_dlq_total", unit="1", description="Messages routed to q.dlq"
+        )
         self.retry_count = m.create_counter(
             "swarm_retry_total", unit="1", description="Messages routed to a retry-ladder rung"
         )
         self.breaker_opens = m.create_counter(
-            "swarm_circuit_breaker_opens_total", unit="1", description="Circuit breaker CLOSED/HALF_OPEN -> OPEN transitions"
+            "swarm_circuit_breaker_opens_total",
+            unit="1",
+            description="Circuit breaker CLOSED/HALF_OPEN -> OPEN transitions",
         )
         self.rate_limit_delays = m.create_counter(
-            "swarm_rate_limit_delays_total", unit="1", description="LLM calls delayed by the rate limiter"
+            "swarm_rate_limit_delays_total",
+            unit="1",
+            description="LLM calls delayed by the rate limiter",
         )
         # Metric *names* below deliberately omit their unit (e.g.
         # "swarm_review_duration", not "swarm_review_duration_ms"): the
@@ -282,10 +295,14 @@ class Metrics:
         )
         # LLM observability
         self.llm_calls = m.create_counter(
-            "swarm_llm_calls_total", unit="1", description="LLM completion attempts, by provider/model/outcome"
+            "swarm_llm_calls_total",
+            unit="1",
+            description="LLM completion attempts, by provider/model/outcome",
         )
         self.llm_failures = m.create_counter(
-            "swarm_llm_failures_total", unit="1", description="LLM completion failures, by provider/model/reason"
+            "swarm_llm_failures_total",
+            unit="1",
+            description="LLM completion failures, by provider/model/reason",
         )
         self.llm_tokens_in = m.create_counter(
             "swarm_llm_tokens_in_total", unit="1", description="LLM input tokens consumed"
@@ -294,38 +311,52 @@ class Metrics:
             "swarm_llm_tokens_out_total", unit="1", description="LLM output tokens generated"
         )
         self.llm_cost_usd = m.create_counter(
-            "swarm_llm_cost_usd_total", unit="usd", description="Estimated LLM spend (see PRICING_PER_1M_TOKENS_USD)"
+            "swarm_llm_cost_usd_total",
+            unit="usd",
+            description="Estimated LLM spend (see PRICING_PER_1M_TOKENS_USD)",
         )
         self.llm_duration_ms = m.create_histogram(
             "swarm_llm_duration", unit="ms", description="LLM completion latency"
         )
         # Slack
         self.slack_deliveries = m.create_counter(
-            "swarm_slack_deliveries_total", unit="1", description="Slack notification attempts, by outcome"
+            "swarm_slack_deliveries_total",
+            unit="1",
+            description="Slack notification attempts, by outcome",
         )
         # Repository
         self.repo_clones = m.create_counter(
             "swarm_repository_clones_total", unit="1", description="Fresh `git clone` operations"
         )
         self.repo_cache_hits = m.create_counter(
-            "swarm_repository_cache_hits_total", unit="1", description="Repository cache hits (no clone needed)"
+            "swarm_repository_cache_hits_total",
+            unit="1",
+            description="Repository cache hits (no clone needed)",
         )
         self.repo_clone_duration_ms = m.create_histogram(
             "swarm_repository_clone_duration", unit="ms", description="`git clone` duration"
         )
         self.repo_refresh_duration_ms = m.create_histogram(
-            "swarm_repository_refresh_duration", unit="ms", description="`git fetch` (refresh) duration"
+            "swarm_repository_refresh_duration",
+            unit="ms",
+            description="`git fetch` (refresh) duration",
         )
         # Analysis/review durations
         self.blast_radius_duration_ms = m.create_histogram(
-            "swarm_blast_radius_duration", unit="ms", description="Blast-radius recursive-CTE query duration"
+            "swarm_blast_radius_duration",
+            unit="ms",
+            description="Blast-radius recursive-CTE query duration",
         )
         self.review_duration_ms = m.create_histogram(
-            "swarm_review_duration", unit="ms", description="End-to-end findings.ready -> review.completed duration"
+            "swarm_review_duration",
+            unit="ms",
+            description="End-to-end findings.ready -> review.completed duration",
         )
         # Postgres
         self.db_write_duration_ms = m.create_histogram(
-            "swarm_db_write_duration", unit="ms", description="Postgres write duration, by table/operation"
+            "swarm_db_write_duration",
+            unit="ms",
+            description="Postgres write duration, by table/operation",
         )
         self.db_query_duration_ms = m.create_histogram(
             "swarm_db_query_duration", unit="ms", description="Postgres read/query duration"
@@ -342,7 +373,18 @@ def get_metrics() -> Metrics:
     return _metrics_singleton
 
 
-def register_pool_gauges(component: str, pool_getter: Callable[[], object | None]) -> None:
+class _SizedPool(Protocol):
+    """Structural shape of the connection pool ``register_pool_gauges``
+    needs (asyncpg.Pool satisfies this) — kept as a local Protocol rather
+    than importing asyncpg here, since this module has no other reason to
+    depend on it (the watcher uses telemetry without ever touching Postgres).
+    """
+
+    def get_size(self) -> int: ...
+    def get_idle_size(self) -> int: ...
+
+
+def register_pool_gauges(component: str, pool_getter: Callable[[], _SizedPool | None]) -> None:
     """Register observable gauges for an asyncpg pool's in-use/idle/size,
     sampled at scrape time via ``pool_getter()`` (returns ``None`` before
     ``connect()`` — the callback just reports nothing that tick).
@@ -386,7 +428,7 @@ def span(
     name: str,
     *,
     kind: SpanKind = SpanKind.INTERNAL,
-    attributes: Mapping[str, object] | None = None,
+    attributes: Attributes = None,
     tracer_name: str = "swarm",
 ) -> Iterator[Span]:
     """Generic internal span. ``start_as_current_span`` already records an
@@ -394,7 +436,9 @@ def span(
     propagates out of the block, so a failed step is visible in Phoenix
     without every call site having to do that bookkeeping."""
     tracer = get_tracer(tracer_name)
-    with tracer.start_as_current_span(name, kind=kind, attributes=dict(attributes or {})) as current_span:
+    with tracer.start_as_current_span(
+        name, kind=kind, attributes=dict(attributes or {})
+    ) as current_span:
         yield current_span
 
 
@@ -420,7 +464,7 @@ def producer_span(
     name: str,
     headers: MutableMapping[str, str],
     *,
-    attributes: Mapping[str, object] | None = None,
+    attributes: Attributes = None,
     tracer_name: str = "shared.broker",
 ) -> Iterator[Span]:
     """Open a PRODUCER span and inject its context into ``headers`` (the
@@ -439,7 +483,7 @@ def consumer_span(
     name: str,
     headers: Mapping[str, object] | None,
     *,
-    attributes: Mapping[str, object] | None = None,
+    attributes: Attributes = None,
     tracer_name: str = "shared.broker",
 ) -> Iterator[Span]:
     """Open a CONSUMER span as a child of the remote PRODUCER span whose
@@ -497,7 +541,9 @@ def _env_price_override(model: str) -> tuple[float, float] | None:
         return None
 
 
-def estimate_cost_usd(provider: str, model: str, input_tokens: int, output_tokens: int) -> float | None:
+def estimate_cost_usd(
+    provider: str, model: str, input_tokens: int, output_tokens: int
+) -> float | None:
     """Best-effort USD cost estimate from a static price list (env
     overridable). Returns ``None`` for a local/free provider (Ollama) or
     an unrecognized model — callers should skip recording cost rather
@@ -528,7 +574,7 @@ def record_llm_success(
     m.llm_tokens_out.add(output_tokens, attrs)
     m.llm_duration_ms.record(latency_ms, attrs)
     cost = estimate_cost_usd(provider, model, input_tokens, output_tokens)
-    span_attrs: dict[str, object] = {
+    span_attrs: dict[str, str | int | float] = {
         "llm.provider": provider,
         "llm.model": model,
         "llm.tokens.input": input_tokens,
@@ -546,5 +592,10 @@ def record_llm_failure(*, provider: str, model: str, reason: str) -> None:
     m = get_metrics()
     m.llm_failures.add(1, {"provider": provider, "model": model, "reason": reason})
     trace.get_current_span().set_attributes(
-        {"llm.provider": provider, "llm.model": model, "llm.status": "failed", "llm.failure_reason": reason}
+        {
+            "llm.provider": provider,
+            "llm.model": model,
+            "llm.status": "failed",
+            "llm.failure_reason": reason,
+        }
     )

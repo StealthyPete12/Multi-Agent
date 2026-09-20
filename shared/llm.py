@@ -33,8 +33,9 @@ import asyncio
 import os
 import random
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Protocol, TypeVar, runtime_checkable
+from typing import Protocol, TypeVar, runtime_checkable
 
 import httpx
 from opentelemetry.trace import SpanKind
@@ -105,6 +106,8 @@ class LLMClient(Protocol):
     """Provider-agnostic completion interface. Every implementation in
     this module satisfies this protocol; nothing outside this module
     should implement it directly."""
+
+    provider: str
 
     async def complete(
         self,
@@ -198,9 +201,7 @@ class _BaseLLMClient:
                 extra={"provider": self.provider, "model": self.model, "reason": str(exc)},
             )
 
-    async def _execute_with_resilience(
-        self, operation: Callable[[], Awaitable[_T]]
-    ) -> _T:
+    async def _execute_with_resilience(self, operation: Callable[[], Awaitable[_T]]) -> _T:
         """Run ``operation()`` (one full request+parse attempt) behind the
         rate limiter and circuit breaker, retrying with backoff+jitter on
         :class:`~shared.errors.RetryableError`-classified failures up to
@@ -249,7 +250,8 @@ class _BaseLLMClient:
                     )
                     current_span.set_attribute("llm.breaker_state", breaker.state.value)
                     telemetry.get_metrics().llm_calls.add(
-                        1, {"provider": self.provider, "model": self.model, "outcome": "circuit_open"}
+                        1,
+                        {"provider": self.provider, "model": self.model, "outcome": "circuit_open"},
                     )
                     telemetry.record_llm_failure(
                         provider=self.provider, model=self.model, reason="circuit_open"
@@ -359,7 +361,9 @@ class AnthropicClient(_BaseLLMClient):
             latency_ms = (time.monotonic() - started) * 1000
             try:
                 text = "".join(
-                    block.get("text", "") for block in data["content"] if block.get("type") == "text"
+                    block.get("text", "")
+                    for block in data["content"]
+                    if block.get("type") == "text"
                 )
                 usage = data.get("usage", {})
                 response = LLMResponse(

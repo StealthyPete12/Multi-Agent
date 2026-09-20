@@ -55,7 +55,9 @@ class IdempotencyStore:
     pool reference — safe to construct fresh per call site, or share one
     instance across a consumer's lifetime."""
 
-    def __init__(self, pool: asyncpg.Pool, *, stale_after_seconds: float = DEFAULT_STALE_CLAIM_SECONDS) -> None:
+    def __init__(
+        self, pool: asyncpg.Pool, *, stale_after_seconds: float = DEFAULT_STALE_CLAIM_SECONDS
+    ) -> None:
         self._pool = pool
         self.stale_after_seconds = stale_after_seconds
 
@@ -83,7 +85,12 @@ class IdempotencyStore:
         if inserted is not None:
             log.info(
                 "idempotency claim",
-                extra={"event_id": event_id, "event_type": event_type, "claimed": True, "reclaimed": False},
+                extra={
+                    "event_id": event_id,
+                    "event_type": event_type,
+                    "claimed": True,
+                    "reclaimed": False,
+                },
             )
             return True
 
@@ -103,7 +110,12 @@ class IdempotencyStore:
         claimed = reclaimed is not None
         log.info(
             "idempotency claim",
-            extra={"event_id": event_id, "event_type": event_type, "claimed": claimed, "reclaimed": claimed},
+            extra={
+                "event_id": event_id,
+                "event_type": event_type,
+                "claimed": claimed,
+                "reclaimed": claimed,
+            },
         )
         return claimed
 
@@ -133,6 +145,7 @@ class IdempotencyStore:
 
     async def is_completed(self, event_id: str) -> bool:
         row = await self._pool.fetchrow(
-            "SELECT 1 FROM processed_events WHERE event_id = $1 AND completed_at IS NOT NULL", event_id
+            "SELECT 1 FROM processed_events WHERE event_id = $1 AND completed_at IS NOT NULL",
+            event_id,
         )
         return row is not None

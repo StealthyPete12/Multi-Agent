@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from agents.reviewer.prompts import build_fallback_narrative, build_narrative_prompt
 from agents.reviewer.scoring import compute_score
@@ -6,19 +6,21 @@ from shared.contracts import BlastRadius, FindingsReady
 
 
 def _findings(**overrides) -> FindingsReady:
-    now = datetime.now(timezone.utc)
-    defaults = dict(
-        commit_sha="a" * 40,
-        agent_name="researcher",
-        findings=[],
-        started_at=now,
-        completed_at=now,
-        repo="acme/widgets",
-        changed_files=["auth/login.py"],
-        blast_radius=BlastRadius(impacted_modules=["auth.login", "checkout"], impact_count=2, max_depth=2),
-        sensitive_hits=["auth/login.py"],
-        semantic_summary="Refactors login validation.",
-    )
+    now = datetime.now(UTC)
+    defaults = {
+        "commit_sha": "a" * 40,
+        "agent_name": "researcher",
+        "findings": [],
+        "started_at": now,
+        "completed_at": now,
+        "repo": "acme/widgets",
+        "changed_files": ["auth/login.py"],
+        "blast_radius": BlastRadius(
+            impacted_modules=["auth.login", "checkout"], impact_count=2, max_depth=2
+        ),
+        "sensitive_hits": ["auth/login.py"],
+        "semantic_summary": "Refactors login validation.",
+    }
     defaults.update(overrides)
     return FindingsReady(**defaults)
 
@@ -40,7 +42,9 @@ def test_build_narrative_prompt_includes_all_required_evidence():
 
 def test_build_narrative_prompt_handles_empty_optional_fields():
     findings = _findings(
-        changed_files=[], sensitive_hits=[], semantic_summary="",
+        changed_files=[],
+        sensitive_hits=[],
+        semantic_summary="",
         blast_radius=BlastRadius(impacted_modules=[], impact_count=0, max_depth=0),
     )
     breakdown = compute_score(findings)

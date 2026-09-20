@@ -38,9 +38,7 @@ async def test_wait_and_acquire_raises_timeout_when_budget_too_small(redis_avail
         pytest.skip("redis not reachable")
     # 1 token/minute capacity 1: first call succeeds, second needs ~60s to
     # refill, which exceeds a tiny max_wait_seconds budget.
-    limiter = RateLimiter(
-        get_redis_client(), tokens_per_minute=1, capacity=1, max_wait_seconds=0.2
-    )
+    limiter = RateLimiter(get_redis_client(), tokens_per_minute=1, capacity=1, max_wait_seconds=0.2)
     first = await limiter.acquire(bucket_key, tokens=1)
     assert first.allowed is True
 

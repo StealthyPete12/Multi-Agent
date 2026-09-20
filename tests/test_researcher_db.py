@@ -33,9 +33,7 @@ async def test_store_graph_is_idempotent_on_rerun(postgres_available):
         assert ids_first == ids_second
 
         async with db.pool.acquire() as conn:
-            module_count = await conn.fetchval(
-                "SELECT count(*) FROM modules WHERE repo = $1", repo
-            )
+            module_count = await conn.fetchval("SELECT count(*) FROM modules WHERE repo = $1", repo)
             import_count = await conn.fetchval(
                 """
                 SELECT count(*) FROM imports i
@@ -65,7 +63,9 @@ async def test_store_graph_replaces_stale_imports(postgres_available):
         await db.store_graph(repo, _simple_graph())
 
         graph_without_import = DependencyGraph()
-        graph_without_import.add_module(ModuleInfo(name="database", path="database.py", is_package=False))
+        graph_without_import.add_module(
+            ModuleInfo(name="database", path="database.py", is_package=False)
+        )
         graph_without_import.add_module(ModuleInfo(name="auth", path="auth.py", is_package=False))
         await db.store_graph(repo, graph_without_import)
 

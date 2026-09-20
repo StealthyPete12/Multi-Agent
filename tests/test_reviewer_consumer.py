@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -113,11 +113,18 @@ class FakeRetryLadder:
 
     async def send_to_dlq(self, envelope, *, reason, attempt, original_queue):
         self.dlq.append(
-            {"envelope": envelope, "reason": reason, "attempt": attempt, "original_queue": original_queue}
+            {
+                "envelope": envelope,
+                "reason": reason,
+                "attempt": attempt,
+                "original_queue": original_queue,
+            }
         )
 
     async def send_raw_to_dlq(self, raw_body, *, reason, original_queue):
-        self.raw_dlq.append({"raw_body": raw_body, "reason": reason, "original_queue": original_queue})
+        self.raw_dlq.append(
+            {"raw_body": raw_body, "reason": reason, "original_queue": original_queue}
+        )
 
 
 class FakeIdempotency:
@@ -139,19 +146,19 @@ class FakeIdempotency:
 
 
 def _findings(**overrides) -> FindingsReady:
-    now = datetime.now(timezone.utc)
-    defaults = dict(
-        commit_sha="a" * 40,
-        agent_name="researcher",
-        findings=[],
-        started_at=now,
-        completed_at=now,
-        repo="acme/widgets",
-        changed_files=["tests/test_widget.py"],
-        blast_radius=BlastRadius(impacted_modules=[], impact_count=0, max_depth=0),
-        sensitive_hits=[],
-        semantic_summary="A small change.",
-    )
+    now = datetime.now(UTC)
+    defaults = {
+        "commit_sha": "a" * 40,
+        "agent_name": "researcher",
+        "findings": [],
+        "started_at": now,
+        "completed_at": now,
+        "repo": "acme/widgets",
+        "changed_files": ["tests/test_widget.py"],
+        "blast_radius": BlastRadius(impacted_modules=[], impact_count=0, max_depth=0),
+        "sensitive_hits": [],
+        "semantic_summary": "A small change.",
+    }
     defaults.update(overrides)
     return FindingsReady(**defaults)
 
@@ -236,14 +243,14 @@ async def test_process_findings_sensitive_hit_escalates_status():
 
 
 def _handle_kwargs(broker, storage, llm_client, slack, retry_ladder=None, idempotency=None):
-    return dict(
-        broker=broker,
-        storage=storage,
-        llm_client=llm_client,
-        slack=slack,
-        retry_ladder=retry_ladder or FakeRetryLadder(),
-        idempotency=idempotency or FakeIdempotency(),
-    )
+    return {
+        "broker": broker,
+        "storage": storage,
+        "llm_client": llm_client,
+        "slack": slack,
+        "retry_ladder": retry_ladder or FakeRetryLadder(),
+        "idempotency": idempotency or FakeIdempotency(),
+    }
 
 
 async def test_handle_message_valid_publishes_review_completed():
