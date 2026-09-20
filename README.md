@@ -58,7 +58,7 @@ OpenTelemetry → Phoenix / Prometheus → Grafana observability stack wired
 into every service — is diagrammed below and in
 [`docs/architecture.md`](docs/architecture.md):
 
-![System architecture: GitHub through Watcher, RabbitMQ, Researcher, Dependency Graph, Blast Radius Engine, Findings Queue, Reviewer, Postgres, Slack, with Redis/Phoenix/Prometheus/Grafana attached](docs/images/architecture.png)
+![System architecture: GitHub through Watcher, RabbitMQ, Researcher, Dependency Graph, Blast Radius Engine, Findings Queue, Reviewer, Postgres, Slack, with Redis/OpenTelemetry/Phoenix/Prometheus/Grafana attached](docs/images/architecture_overview.png)
 
 ## How It Works
 
@@ -245,44 +245,32 @@ Slack Block Kit message, and publishes `review.completed` — closing the
 loop on the same `trace_id` the watcher generated when the webhook first
 arrived. A second, real recorded run of this exact pipeline — one
 `trace_id` spanning all three services end to end — is in
-[`docs/demo/`](docs/demo/); the event-flow diagram below shows what
-happens when a step in this chain fails instead of succeeding.
+[`docs/demo/`](docs/demo/).
 
-## Event Flow & Reliability Routing
+## Blast Radius Example
 
-```mermaid
-flowchart LR
-    CD(["commit.detected"]) --> QC["q.commits"]
-    QC --> Researcher
+The worked example above shows the real payments-platform run; this is
+the same capability distilled to its simplest possible case — one file,
+one import chain — to make the mechanism itself obvious at a glance.
 
-    Researcher -->|success| FR(["findings.ready"])
-    Researcher -->|exception| C1{"classify_exception()"}
-    C1 -->|RetryableError| L1["Retry ladder\n5s -> 30s -> 5m"]
-    L1 -->|redelivered| QC
-    L1 -->|attempts exhausted| DLQ[("q.dlq")]
-    C1 -->|PoisonMessageError| DLQ
+**Simulated repository:** a single import chain, `database.py` at the
+root, three modules depending on it transitively:
 
-    FR --> QF["q.findings"]
-    QF --> Reviewer
+![Blast radius example: database.py is changed and highlighted, with auth.py, payments.py, and checkout.py each importing the module above it in the chain; the result panel reads Changed File database.py, Impact Count 4, Risk HIGH](docs/images/blast_radius_example.png)
 
-    Reviewer -->|success| RC(["review.completed"])
-    Reviewer -->|exception| C2{"classify_exception()"}
-    C2 -->|RetryableError| L2["Retry ladder\n5s -> 30s -> 5m"]
-    L2 -->|redelivered| QF
-    L2 -->|attempts exhausted| DLQ
-    C2 -->|PoisonMessageError| DLQ
+| | |
+|---|---|
+| Changed file | `database.py` |
+| Impact count | 4 (`database.py` + 3 transitive dependents) |
+| Max depth | 3 |
+| Risk | **HIGH** |
 
-    RC --> QR["q.reviews"]
-    DLQ -->|"tools/replay_dlq.py"| QC
-    DLQ -->|"tools/replay_dlq.py"| QF
-
-    classDef event fill:#16a34a,color:#fff,stroke:none;
-    classDef term fill:#dc2626,color:#fff,stroke:none;
-    class CD,FR,RC event;
-    class DLQ term;
-```
-
-Static render: [`docs/images/event-flow.png`](docs/images/event-flow.png).
+A one-line change to `database.py` doesn't just touch that file — it
+propagates through `auth.py` and `payments.py` all the way to
+`checkout.py`, three hops away. This is exactly what
+`agents/researcher/impact.py` computes for every real commit: not "what
+did you change," but "what could this change break," traced through the
+codebase's actual import graph rather than guessed at.
 
 ## Dependency Graph Analysis
 
@@ -335,7 +323,45 @@ correctly overrode that and pushed it to `needs_review`.
 ## Reliability Engineering
 
 RabbitMQ's at-least-once delivery means every one of these had to be
-solved for real, not assumed away:
+solved for real, not assumed away. Every event is routed through the same
+retry ladder, idempotency gate, and dead-letter path regardless of which
+agent is consuming it:
+
+```mermaid
+flowchart LR
+    CD(["commit.detected"]) --> QC["q.commits"]
+    QC --> Researcher
+
+    Researcher -->|success| FR(["findings.ready"])
+    Researcher -->|exception| C1{"classify_exception()"}
+    C1 -->|RetryableError| L1["Retry ladder\n5s -> 30s -> 5m"]
+    L1 -->|redelivered| QC
+    L1 -->|attempts exhausted| DLQ[("q.dlq")]
+    C1 -->|PoisonMessageError| DLQ
+
+    FR --> QF["q.findings"]
+    QF --> Reviewer
+
+    Reviewer -->|success| RC(["review.completed"])
+    Reviewer -->|exception| C2{"classify_exception()"}
+    C2 -->|RetryableError| L2["Retry ladder\n5s -> 30s -> 5m"]
+    L2 -->|redelivered| QF
+    L2 -->|attempts exhausted| DLQ
+    C2 -->|PoisonMessageError| DLQ
+
+    RC --> QR["q.reviews"]
+    DLQ -->|"tools/replay_dlq.py"| QC
+    DLQ -->|"tools/replay_dlq.py"| QF
+
+    classDef event fill:#16a34a,color:#fff,stroke:none;
+    classDef term fill:#dc2626,color:#fff,stroke:none;
+    class CD,FR,RC event;
+    class DLQ term;
+```
+
+Static render, with the idempotency-claim gate each consumer passes
+through before doing any work:
+[`docs/images/event_flow.png`](docs/images/event_flow.png).
 
 - **TTL + dead-letter-exchange retry ladder** (`shared/retry.py`) — a
   hand-built `q.retry.5s → q.retry.30s → q.retry.5m → q.dlq` pattern,
@@ -376,7 +402,37 @@ solved for real, not assumed away:
   malformed-contract, duplicate-delivery, and circuit-breaker-full-cycle
   scenarios against a live broker and database.
 
-## Observability
+![Five reliability mechanisms protecting the pipeline: retry ladder, circuit breaker, dead letter queue, idempotency claims, and rate limiting, each shown with the module that implements it](docs/images/reliability_features.png)
+
+## Performance Results
+
+100-commit load test (`tools/load_test.py`) against a real local git
+fixture, published through the actual `Broker`, polled to completion in
+Postgres — single researcher + single reviewer instance:
+
+![Performance infographic: 100 of 100 commits completed, 7.85 commits per second throughput, 0 DLQ messages, 234 tests passing, and a latency distribution bar chart showing average, p50, p95, and p99 publish-to-persisted latency](docs/images/performance_summary.png)
+
+| Metric | Value |
+|---|---|
+| Commits submitted / completed | 100 / 100 |
+| DLQ messages | 0 |
+| Throughput | 7.85 commits/sec |
+| Average latency | 5081.0 ms |
+| p50 latency (publish → report persisted) | 4385.6 ms |
+| p95 latency | 11286.7 ms |
+| p99 latency | 12248.3 ms |
+
+Zero DLQ messages and zero ERROR-level log lines across both agents for
+the run's duration. Latency grows with queue position by design —
+`prefetch_count=1` means the researcher processes strictly one commit at a
+time, an intentional consumer-hygiene choice (see
+[Reliability Engineering](#reliability-engineering)), not a bottleneck —
+and both agents are safe to scale horizontally behind the same queue,
+since every consumer claims work idempotently before processing it. Full
+methodology, environment details, and known bottlenecks in
+[`docs/performance.md`](docs/performance.md).
+
+## Observability Highlights
 
 Every service ships tracing, metrics, and structured logs from the same
 `shared/telemetry.py` module — none of it bolted on after the fact:
@@ -401,41 +457,15 @@ Every service ships tracing, metrics, and structured logs from the same
 - **Per-call LLM cost estimation**, recorded as both a span attribute and
   a Prometheus counter.
 
-![RabbitMQ queue topology](docs/screenshots/rabbitmq_queues.png)
-![Grafana System Overview dashboard](docs/screenshots/grafana_system_overview.png)
-![A real end-to-end distributed trace in Phoenix](docs/screenshots/phoenix_trace_waterfall.png)
+![Grafana System Overview dashboard, populated by a real 100-commit load test run](docs/screenshots/grafana_system_overview.png)
 
-More in [`docs/screenshots/`](docs/screenshots/) and full diagrams (data
-flow, observability stack, persistence layout) in
+The full observability evidence set — RabbitMQ's live queue topology and
+a real distributed trace waterfall in Phoenix, alongside this dashboard —
+is in [`docs/screenshots/`](docs/screenshots/); full diagrams (data flow,
+observability stack, persistence layout) are in
 [`docs/architecture.md`](docs/architecture.md).
 
-## Performance
-
-100-commit load test (`tools/load_test.py`) against a real local git
-fixture, published through the actual `Broker`, polled to completion in
-Postgres — single researcher + single reviewer instance:
-
-| Metric | Value |
-|---|---|
-| Commits submitted / completed | 100 / 100 |
-| DLQ messages | 0 |
-| Throughput | 7.85 commits/sec |
-| Average latency | 5081.0 ms |
-| p50 latency (publish → report persisted) | 4385.6 ms |
-| p95 latency | 11286.7 ms |
-| p99 latency | 12248.3 ms |
-
-Zero DLQ messages and zero ERROR-level log lines across both agents for
-the run's duration. Latency grows with queue position by design —
-`prefetch_count=1` means the researcher processes strictly one commit at a
-time, an intentional consumer-hygiene choice (see
-[Reliability Engineering](#reliability-engineering)), not a bottleneck —
-and both agents are safe to scale horizontally behind the same queue,
-since every consumer claims work idempotently before processing it. Full
-methodology, environment details, and known bottlenecks in
-[`docs/performance.md`](docs/performance.md).
-
-## Technical Highlights
+## Technical Achievements
 
 Engineering decisions worth calling out on their own:
 
