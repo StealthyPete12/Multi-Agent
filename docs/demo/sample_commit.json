@@ -1,0 +1,22 @@
+{
+  "event_id": "b7f52a50-0aeb-45c1-9ec2-a80acf44f814",
+  "event_type": "commit.detected",
+  "schema_version": "1.0",
+  "trace_id": "8b2a38d0-19bf-4b71-a3fe-e68eafe880b3",
+  "correlation_id": null,
+  "source": "watcher",
+  "occurred_at": "2026-03-12T14:32:05Z",
+  "payload": {
+    "schema_version": "1.0",
+    "repo": "acme/widgets",
+    "commit_sha": "4f6a1c9e2b7d3a58f0c1e9d6b4a7c3f8e1d2a5b6",
+    "branch": "main",
+    "author": "jane@acme.dev",
+    "message": "fix: tighten session expiry check in login flow",
+    "committed_at": "2026-03-12T14:32:05Z",
+    "changed_files": [
+      "auth/login.py",
+      "auth/session.py"
+    ]
+  }
+}

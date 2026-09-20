@@ -1,0 +1,70 @@
+{
+  "attachments": [
+    {
+      "color": "#ecb22e",
+      "blocks": [
+        {
+          "type": "header",
+          "text": {
+            "type": "plain_text",
+            "text": "Code Review: MODERATE",
+            "emoji": true
+          }
+        },
+        {
+          "type": "section",
+          "fields": [
+            {
+              "type": "mrkdwn",
+              "text": "*Repository:*\nacme/widgets"
+            },
+            {
+              "type": "mrkdwn",
+              "text": "*Commit SHA:*\n`4f6a1c9e2b7d3a58f0c1e9d6b4a7c3f8e1d2a5b6`"
+            },
+            {
+              "type": "mrkdwn",
+              "text": "*Severity:*\nMODERATE"
+            },
+            {
+              "type": "mrkdwn",
+              "text": "*Risk Score:*\n4"
+            },
+            {
+              "type": "mrkdwn",
+              "text": "*Blast Radius:*\n4 modules, depth 3"
+            },
+            {
+              "type": "mrkdwn",
+              "text": "*Sensitive Hits:*\nauth/login.py"
+            }
+          ]
+        },
+        {
+          "type": "divider"
+        },
+        {
+          "type": "section",
+          "text": {
+            "type": "mrkdwn",
+            "text": "*Narrative:*\nThis commit touches auth/login.py and auth/session.py, both matched by the sensitive-path policy for authentication code, which is why the score includes sensitive-hit points even though the blast radius is moderate (4 impacted modules, max depth 3: auth.login -> auth.session -> payments.charge -> checkout). Review the session-expiry logic change carefully and confirm the payments path still receives a valid session before charge submission; no test file was touched in this commit, so test coverage for the new expiry check should be verified manually."
+          }
+        },
+        {
+          "type": "actions",
+          "elements": [
+            {
+              "type": "button",
+              "text": {
+                "type": "plain_text",
+                "text": "View Commit",
+                "emoji": true
+              },
+              "url": "https://github.com/acme/widgets/commit/4f6a1c9e2b7d3a58f0c1e9d6b4a7c3f8e1d2a5b6"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

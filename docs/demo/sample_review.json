@@ -1,0 +1,54 @@
+{
+  "review_completed_event": {
+    "event_id": "fe27d89c-8e38-42e0-a603-457eb36707a8",
+    "event_type": "review.completed",
+    "schema_version": "1.0",
+    "trace_id": "8b2a38d0-19bf-4b71-a3fe-e68eafe880b3",
+    "correlation_id": "c3b308a1-9afd-42ba-adf5-f465fcba4168",
+    "source": "reviewer",
+    "occurred_at": "2026-03-12T14:32:08.940000Z",
+    "payload": {
+      "schema_version": "1.0",
+      "commit_sha": "4f6a1c9e2b7d3a58f0c1e9d6b4a7c3f8e1d2a5b6",
+      "repo": "acme/widgets",
+      "report_id": "922039c1-4b1a-4e3d-9c7a-6f2b8e1a5d40",
+      "status": "needs_review",
+      "severity": "moderate",
+      "score": 4,
+      "summary": "This commit touches auth/login.py and auth/session.py, both matched by the sensitive-path policy for authentication code, which is why the score includes sensitive-hit points even though the blast radius is moderate (4 impacted modules, max depth 3: auth.login -> auth.session -> payments.charge -> checkout). Review the session-expiry logic change carefully and confirm the payments path still receives a valid session before charge submission; no test file was touched in this commit, so test coverage for the new expiry check should be verified manually.",
+      "total_findings": 1,
+      "completed_at": "2026-03-12T14:32:08.940000Z"
+    }
+  },
+  "persisted_report_row": {
+    "id": "922039c1-4b1a-4e3d-9c7a-6f2b8e1a5d40",
+    "commit_id": null,
+    "repo": "acme/widgets",
+    "commit_sha": "4f6a1c9e2b7d3a58f0c1e9d6b4a7c3f8e1d2a5b6",
+    "severity": "moderate",
+    "score": 4,
+    "score_breakdown": {
+      "blast_radius_points": 0,
+      "impact_count_points": 0,
+      "sensitive_hits_points": 2,
+      "changed_files_points": 0,
+      "test_proximity_points": 2
+    },
+    "narrative": "This commit touches auth/login.py and auth/session.py, both matched by the sensitive-path policy for authentication code, which is why the score includes sensitive-hit points even though the blast radius is moderate (4 impacted modules, max depth 3: auth.login -> auth.session -> payments.charge -> checkout). Review the session-expiry logic change carefully and confirm the payments path still receives a valid session before charge submission; no test file was touched in this commit, so test coverage for the new expiry check should be verified manually.",
+    "blast_radius": {
+      "impacted_modules": [
+        "auth.login",
+        "auth.session",
+        "payments.charge",
+        "checkout"
+      ],
+      "impact_count": 4,
+      "max_depth": 3
+    },
+    "sensitive_hits": [
+      "auth/login.py"
+    ],
+    "source_event_id": "c3b308a1-9afd-42ba-adf5-f465fcba4168",
+    "generated_at": "2026-03-12T14:32:08.940000+00:00"
+  }
+}

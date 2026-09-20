@@ -1,0 +1,48 @@
+{
+  "event_id": "c3b308a1-9afd-42ba-adf5-f465fcba4168",
+  "event_type": "findings.ready",
+  "schema_version": "1.0",
+  "trace_id": "8b2a38d0-19bf-4b71-a3fe-e68eafe880b3",
+  "correlation_id": "b7f52a50-0aeb-45c1-9ec2-a80acf44f814",
+  "source": "researcher",
+  "occurred_at": "2026-03-12T14:32:06.210000Z",
+  "payload": {
+    "schema_version": "1.0",
+    "commit_sha": "4f6a1c9e2b7d3a58f0c1e9d6b4a7c3f8e1d2a5b6",
+    "agent_name": "researcher",
+    "findings": [
+      {
+        "file_path": "auth/login.py",
+        "line_number": 42,
+        "severity": "medium",
+        "category": "sensitive-path",
+        "message": "Change touches an authentication-critical module (auth/).",
+        "agent_name": "researcher",
+        "details": {
+          "pattern_matched": "auth/"
+        }
+      }
+    ],
+    "started_at": "2026-03-12T14:32:05Z",
+    "completed_at": "2026-03-12T14:32:06.210000Z",
+    "repo": "acme/widgets",
+    "changed_files": [
+      "auth/login.py",
+      "auth/session.py"
+    ],
+    "blast_radius": {
+      "impacted_modules": [
+        "auth.login",
+        "auth.session",
+        "payments.charge",
+        "checkout"
+      ],
+      "impact_count": 4,
+      "max_depth": 3
+    },
+    "sensitive_hits": [
+      "auth/login.py"
+    ],
+    "semantic_summary": "Tightens the session expiry check in the login flow so an expired session token is rejected before reaching the payments path."
+  }
+}
