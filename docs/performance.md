@@ -124,11 +124,16 @@ concern tracked in `ROADMAP.md`.
 
 ## Observability screenshots
 
-No browser was available in this environment to capture rendered
-Grafana/Phoenix screenshots (same limitation `PHASE_5_REPORT.md`
-documented) — the numbers above were pulled directly from Prometheus's
-HTTP API and RabbitMQ's management API instead, which is the same data
-those dashboards render. Open http://localhost:3000 (Grafana,
-`admin`/`admin`) and http://localhost:6006 (Phoenix) against a running
-stack to see them visually; `docs/architecture.md`'s "Observability
-stack" diagram shows how the pieces connect.
+Captured live in this session (headless Chrome, not mockups) — see
+[`docs/screenshots/`](screenshots/) for the full set and what each one
+shows:
+
+![RabbitMQ queue topology](screenshots/rabbitmq_queues.png)
+![Grafana System Overview dashboard](screenshots/grafana_system_overview.png)
+![Grafana Repository dashboard](screenshots/grafana_repository.png)
+![A real end-to-end distributed trace in Phoenix](screenshots/phoenix_trace_waterfall.png)
+
+Open http://localhost:3000 (Grafana, `admin`/`admin`) and
+http://localhost:6006 (Phoenix) against your own running stack to
+explore interactively; `docs/architecture.md`'s "Observability stack"
+diagram shows how the pieces connect.
