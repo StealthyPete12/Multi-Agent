@@ -5,8 +5,7 @@ import asyncpg
 import pytest
 
 from shared.idempotency import IdempotencyStore
-
-DATABASE_URL = "postgresql://swarm:swarm_dev_password@localhost:5432/code_review_swarm"
+from tests.conftest import DATABASE_URL
 
 
 @pytest.fixture

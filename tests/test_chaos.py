@@ -27,6 +27,7 @@ from shared.contracts import CommitDetected, EventType, make_envelope
 from shared.idempotency import IdempotencyStore
 from shared.llm import AnthropicClient, LLMError
 from shared.retry import DLQ_QUEUE_NAME, HEADER_ATTEMPT, RetryLadder, RetryRung
+from tests.conftest import DATABASE_URL
 from tests.test_researcher_consumer import (
     FakeBroker as ResearcherFakeBroker,
 )
@@ -55,9 +56,6 @@ from tests.test_reviewer_consumer import (
 from tests.test_reviewer_consumer import (
     FakeRetryLadder as ReviewerFakeRetryLadder,
 )
-
-DATABASE_URL = "postgresql://swarm:swarm_dev_password@localhost:5432/code_review_swarm"
-
 
 # ---------------------------------------------------------------------------
 # Scenario A: Researcher crashes while processing.
