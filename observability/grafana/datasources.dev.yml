@@ -1,0 +1,15 @@
+# Grafana datasource for docker-compose.dev.yml and docker-compose.prod.yml,
+# where Grafana and Prometheus are both containers on one bridge network
+# (unlike docker-compose.yml's network_mode: host setup, which uses
+# observability/grafana/provisioning/datasources/datasources.yml
+# pointing at http://localhost:9090).
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false

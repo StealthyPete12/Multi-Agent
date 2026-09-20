@@ -1,0 +1,46 @@
+# Prometheus scrape configuration for docker-compose.dev.yml and
+# docker-compose.prod.yml (both use bridge networking + service-name DNS,
+# unlike docker-compose.yml's network_mode: host).
+#
+# Unlike docker-compose.yml (which runs Prometheus with network_mode: host
+# to work around this project's sandbox blocking fresh container-to-container
+# bridge traffic — see PHASE_5_REPORT.md), docker-compose.dev.yml runs every
+# service, including the three agents, as containers on one normal bridge
+# network. Targets here are therefore service names, not localhost.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: watcher
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["watcher:8001"]
+        labels: { service: watcher }
+
+  - job_name: researcher
+    static_configs:
+      - targets: ["researcher:9102"]
+        labels: { service: researcher }
+
+  - job_name: reviewer
+    static_configs:
+      - targets: ["reviewer:9103"]
+        labels: { service: reviewer }
+
+  - job_name: rabbitmq
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["rabbitmq:15692"]
+        labels: { service: rabbitmq }
+
+  - job_name: postgres
+    static_configs:
+      - targets: ["postgres_exporter:9187"]
+        labels: { service: postgres }
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+        labels: { service: prometheus }

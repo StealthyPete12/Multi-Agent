@@ -1,0 +1,263 @@
+# Development stack — everything as containers on one bridge network,
+# including the three agents (built from agents/*/Dockerfile).
+#
+# This is the "clone the repo, run one command, see the whole pipeline"
+# path for a new engineer. Unlike docker-compose.yml (infra only, agents
+# run as host processes, network_mode: host — the setup this project was
+# originally developed and load-tested against, see PHASE_5_REPORT.md's
+# "Known limitations" for why), this file uses normal Docker bridge
+# networking and service-name DNS (rabbitmq, postgres, redis, phoenix,
+# prometheus) throughout, which is what a real developer machine or CI
+# runner supports out of the box.
+#
+# Usage:
+#   cp .env.example .env
+#   docker compose -f docker-compose.dev.yml up --build
+#   python -m tools.seed_commit --random   # from the host, against the
+#                                           # published RabbitMQ port
+#
+# This stack uses its own fixed project name ("swarm-dev") so it can't
+# collide with docker-compose.yml's containers/volumes, but both publish
+# the same host ports (5672, 5432, 6379, 6006, 9090, 3000, ...) — stop one
+# before starting the other.
+
+name: swarm-dev
+
+x-agent-common: &agent-common
+  environment: &agent-env
+    ENVIRONMENT: development
+    LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    RABBITMQ_URL: amqp://${RABBITMQ_USER:-swarm}:${RABBITMQ_PASSWORD:-swarm_dev_password}@rabbitmq:5672/${RABBITMQ_VHOST:-/}
+    RABBITMQ_EXCHANGE: ${RABBITMQ_EXCHANGE:-swarm.events}
+    RABBITMQ_PREFETCH: ${RABBITMQ_PREFETCH:-10}
+    DATABASE_URL: postgresql://${POSTGRES_USER:-swarm}:${POSTGRES_PASSWORD:-swarm_dev_password}@postgres:5432/${POSTGRES_DB:-code_review_swarm}
+    REDIS_URL: redis://:${REDIS_PASSWORD:-swarm_dev_password}@redis:6379/0
+    LLM_PROVIDER: ${LLM_PROVIDER:-none}
+    LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-30}
+    ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-}
+    MODEL_SELECTIONS: ${MODEL_SELECTIONS:-}
+    SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL:-}
+    REPO_WEB_BASE_URL: ${REPO_WEB_BASE_URL:-https://github.com/}
+    RISK_SCORE_MODERATE_THRESHOLD: ${RISK_SCORE_MODERATE_THRESHOLD:-3}
+    RISK_SCORE_HIGH_THRESHOLD: ${RISK_SCORE_HIGH_THRESHOLD:-6}
+    RISK_SCORE_CRITICAL_THRESHOLD: ${RISK_SCORE_CRITICAL_THRESHOLD:-10}
+    RABBITMQ_HEARTBEAT: ${RABBITMQ_HEARTBEAT:-60}
+    QUEUE_DLQ: ${QUEUE_DLQ:-q.dlq}
+    RETRY_DELAY_5S_MS: ${RETRY_DELAY_5S_MS:-5000}
+    RETRY_DELAY_30S_MS: ${RETRY_DELAY_30S_MS:-30000}
+    RETRY_DELAY_5M_MS: ${RETRY_DELAY_5M_MS:-300000}
+    GRACEFUL_SHUTDOWN_SECONDS: ${GRACEFUL_SHUTDOWN_SECONDS:-30}
+    IDEMPOTENCY_STALE_CLAIM_SECONDS: ${IDEMPOTENCY_STALE_CLAIM_SECONDS:-300}
+    LLM_MAX_RETRIES: ${LLM_MAX_RETRIES:-3}
+    LLM_RETRY_BACKOFF_BASE_SECONDS: ${LLM_RETRY_BACKOFF_BASE_SECONDS:-1.0}
+    LLM_RETRY_BACKOFF_MAX_SECONDS: ${LLM_RETRY_BACKOFF_MAX_SECONDS:-20.0}
+    LLM_BREAKER_FAILURE_THRESHOLD: ${LLM_BREAKER_FAILURE_THRESHOLD:-5}
+    LLM_BREAKER_OPEN_SECONDS: ${LLM_BREAKER_OPEN_SECONDS:-60}
+    LLM_RATE_LIMIT_ENABLED: ${LLM_RATE_LIMIT_ENABLED:-true}
+    RATE_LIMIT_TOKENS_PER_MINUTE: ${RATE_LIMIT_TOKENS_PER_MINUTE:-60}
+    RATE_LIMIT_MAX_WAIT_SECONDS: ${RATE_LIMIT_MAX_WAIT_SECONDS:-60}
+    OTEL_TRACES_EXPORTER: ${OTEL_TRACES_EXPORTER:-otlp_http}
+    OTEL_EXPORTER_OTLP_ENDPOINT: http://phoenix:6006
+    OTEL_EXPORTER_OTLP_INSECURE: ${OTEL_EXPORTER_OTLP_INSECURE:-true}
+    OTEL_METRICS_EXPORTER: ${OTEL_METRICS_EXPORTER:-prometheus}
+    OTEL_EXPORTER_PROMETHEUS_HOST: "0.0.0.0"
+  depends_on:
+    rabbitmq:
+      condition: service_healthy
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  restart: unless-stopped
+  networks: [swarm-dev]
+
+services:
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    ports:
+      - "${RABBITMQ_PORT:-5672}:5672"
+      - "${RABBITMQ_MANAGEMENT_PORT:-15672}:15672"
+      - "${RABBITMQ_PROMETHEUS_PORT:-15692}:15692"
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-swarm}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-swarm_dev_password}
+      RABBITMQ_DEFAULT_VHOST: ${RABBITMQ_VHOST:-/}
+    volumes:
+      - rabbitmq_dev_data:/var/lib/rabbitmq
+      - ./observability/rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    networks: [swarm-dev]
+
+  postgres:
+    image: postgres:16
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-swarm}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-swarm_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-code_review_swarm}
+    volumes:
+      - postgres_dev_data:/var/lib/postgresql/data
+      - ./db/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-swarm} -d ${POSTGRES_DB:-code_review_swarm}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    networks: [swarm-dev]
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:-swarm_dev_password}"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_dev_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a ${REDIS_PASSWORD:-swarm_dev_password} ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    networks: [swarm-dev]
+
+  postgres_exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.15.0
+    environment:
+      DATA_SOURCE_NAME: "postgresql://${POSTGRES_USER:-swarm}:${POSTGRES_PASSWORD:-swarm_dev_password}@postgres:5432/${POSTGRES_DB:-code_review_swarm}?sslmode=disable"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:9187/metrics >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    networks: [swarm-dev]
+
+  phoenix:
+    image: arizephoenix/phoenix:latest
+    ports:
+      - "${PHOENIX_UI_PORT:-6006}:6006"
+      - "${PHOENIX_GRPC_PORT:-4317}:4317"
+    environment:
+      PHOENIX_WORKING_DIR: /mnt/data
+    volumes:
+      - phoenix_dev_data:/mnt/data
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:6006/', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    networks: [swarm-dev]
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./observability/prometheus/prometheus.dev.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_dev_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:9090/-/healthy || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    networks: [swarm-dev]
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_dev_data:/var/lib/grafana
+      - ./observability/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./observability/grafana/datasources.dev.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:3000/api/health >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+    networks: [swarm-dev]
+
+  watcher:
+    build:
+      context: .
+      dockerfile: agents/watcher/Dockerfile
+    <<: *agent-common
+    environment:
+      <<: *agent-env
+      WATCHER_PORT: "8001"
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-changeme_dev_secret}
+      WATCHED_BRANCHES: ${WATCHED_BRANCHES:-main}
+    ports:
+      - "${WATCHER_PORT:-8001}:8001"
+
+  researcher:
+    build:
+      context: .
+      dockerfile: agents/researcher/Dockerfile
+    <<: *agent-common
+    environment:
+      <<: *agent-env
+      REPO_CLONE_BASE_URL: ${REPO_CLONE_BASE_URL:-https://github.com/}
+      REPO_STALE_SECONDS: ${REPO_STALE_SECONDS:-300}
+      BLAST_RADIUS_MAX_DEPTH: ${BLAST_RADIUS_MAX_DEPTH:-10}
+      SENSITIVE_PATH_PATTERNS: ${SENSITIVE_PATH_PATTERNS:-auth/,payments/,infra/,migrations/}
+      RESEARCHER_METRICS_PORT: "9102"
+    ports:
+      - "${RESEARCHER_METRICS_PORT:-9102}:9102"
+    volumes:
+      - researcher_dev_repo_cache:/var/lib/swarm/repo-cache
+
+  reviewer:
+    build:
+      context: .
+      dockerfile: agents/reviewer/Dockerfile
+    <<: *agent-common
+    environment:
+      <<: *agent-env
+      REVIEWER_METRICS_PORT: "9103"
+    ports:
+      - "${REVIEWER_METRICS_PORT:-9103}:9103"
+
+networks:
+  swarm-dev:
+
+volumes:
+  rabbitmq_dev_data:
+  postgres_dev_data:
+  redis_dev_data:
+  phoenix_dev_data:
+  prometheus_dev_data:
+  grafana_dev_data:
+  researcher_dev_repo_cache:
