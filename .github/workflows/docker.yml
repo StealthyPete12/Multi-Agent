@@ -1,0 +1,73 @@
+name: Docker
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "agents/**/Dockerfile"
+      - "docker-compose*.yml"
+      - "shared/**"
+      - "agents/**"
+      - "tools/**"
+      - "pyproject.toml"
+      - ".github/workflows/docker.yml"
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build agent images
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [watcher, researcher, reviewer]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build ${{ matrix.service }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: agents/${{ matrix.service }}/Dockerfile
+          push: false
+          load: true
+          tags: code-review-swarm/${{ matrix.service }}:ci
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+      - name: Report image size
+        run: docker images code-review-swarm/${{ matrix.service }}:ci --format "{{.Repository}}:{{.Tag}} = {{.Size}}"
+
+      - name: Smoke-test the image is runnable as non-root
+        run: |
+          user=$(docker inspect code-review-swarm/${{ matrix.service }}:ci --format '{{.Config.User}}')
+          echo "Container user: $user"
+          test -n "$user" -a "$user" != "root" -a "$user" != "0"
+
+  compose-validate:
+    name: Validate compose files
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: docker-compose.yml (infra-only, host networking)
+        run: docker compose -f docker-compose.yml config -q
+
+      - name: docker-compose.dev.yml (full containerized dev stack)
+        run: docker compose -f docker-compose.dev.yml config -q
+        env:
+          GITHUB_WEBHOOK_SECRET: ci_test_secret
+
+      - name: docker-compose.prod.yml (production defaults)
+        run: docker compose -f docker-compose.prod.yml config -q
+        env:
+          RABBITMQ_USER: swarm
+          RABBITMQ_PASSWORD: ci_test_password
+          POSTGRES_USER: swarm
+          POSTGRES_PASSWORD: ci_test_password
+          REDIS_PASSWORD: ci_test_password
+          GRAFANA_ADMIN_USER: admin
+          GRAFANA_ADMIN_PASSWORD: ci_test_password
+          GITHUB_WEBHOOK_SECRET: ci_test_secret

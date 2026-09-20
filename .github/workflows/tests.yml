@@ -1,0 +1,106 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    name: Lint (ruff, black, mypy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install package + dev tools
+        run: pip install -e '.[dev]'
+
+      - name: ruff
+        run: ruff check .
+
+      - name: black --check
+        run: black --check .
+
+      - name: mypy
+        run: mypy
+
+  test:
+    name: Unit + integration tests
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: swarm
+          POSTGRES_PASSWORD: swarm_ci_password
+          POSTGRES_DB: code_review_swarm
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U swarm -d code_review_swarm"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      rabbitmq:
+        image: rabbitmq:3.13-management
+        env:
+          RABBITMQ_DEFAULT_USER: swarm
+          RABBITMQ_DEFAULT_PASS: swarm_ci_password
+        ports: ["5672:5672", "15672:15672"]
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q check_running"
+          --health-interval 5s
+          --health-timeout 10s
+          --health-retries 10
+
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql://swarm:swarm_ci_password@localhost:5432/code_review_swarm
+      RABBITMQ_URL: amqp://swarm:swarm_ci_password@localhost:5672/
+      REDIS_URL: redis://localhost:6379/0
+      LLM_PROVIDER: none
+      SLACK_WEBHOOK_URL: ""
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install package + dev tools
+        run: pip install -e '.[dev]'
+
+      - name: Apply database migrations
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client
+          for f in db/migrations/*.sql; do
+            echo "Applying $f"
+            PGPASSWORD=swarm_ci_password psql -h localhost -U swarm -d code_review_swarm -f "$f"
+          done
+
+      - name: Run test suite
+        run: pytest tests/ -v --junitxml=pytest-report.xml
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-report
+          path: pytest-report.xml

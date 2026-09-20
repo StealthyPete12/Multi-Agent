@@ -1,0 +1,113 @@
+name: Eval PR (synthetic commit pipeline)
+
+# Brings up the full containerized dev stack (docker-compose.dev.yml —
+# watcher/researcher/reviewer as containers, real bridge networking) and
+# pushes a synthetic commit all the way through
+# watcher -> RabbitMQ -> researcher -> RabbitMQ -> reviewer -> Postgres,
+# the same pipeline docs/demo/ and PHASE_2-5_REPORT.md validate manually.
+# A GitHub Actions runner has ordinary Docker bridge networking (unlike
+# the sandbox this project was developed in — see PHASE_5_REPORT.md's
+# "Known limitations" and PHASE_6_REPORT.md), so this is the one place
+# the full containerized pipeline is actually exercised end-to-end.
+#
+# Any step failing fails the job, which blocks the PR via branch
+# protection on this required check.
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  synthetic-pipeline:
+    name: Synthetic commit + smoke tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install package (for tools/seed_commit.py)
+        run: pip install -e .
+
+      - name: Prepare .env
+        run: cp .env.example .env
+
+      - name: Start dev stack
+        run: docker compose -f docker-compose.dev.yml up -d --build
+
+      - name: Wait for all services to become healthy
+        run: |
+          for i in $(seq 1 60); do
+            unhealthy=$(docker compose -f docker-compose.dev.yml ps --format json \
+              | jq -s '[.[] | select(.Health != "" and .Health != "healthy")] | length')
+            echo "unhealthy=$unhealthy (attempt $i/60)"
+            if [ "$unhealthy" = "0" ]; then
+              echo "All services healthy."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Services did not become healthy in time"
+          docker compose -f docker-compose.dev.yml logs
+          exit 1
+
+      - name: Publish a synthetic commit.detected event
+        # octocat/Hello-World is GitHub's own canonical, decade-stable demo
+        # repo — used here (real clone, real commit SHA) instead of a
+        # random/fabricated SHA, which the researcher couldn't clone.
+        env:
+          RABBITMQ_URL: amqp://swarm:swarm_dev_password@localhost:5672/
+        run: |
+          sha=$(git ls-remote https://github.com/octocat/Hello-World HEAD | cut -f1)
+          branch=$(git ls-remote --symref https://github.com/octocat/Hello-World HEAD \
+            | awk '/^ref:/ {sub("refs/heads/", "", $2); print $2}')
+          echo "Using octocat/Hello-World @ $sha (branch: $branch)"
+          python -m tools.seed_commit --repo octocat/Hello-World --branch "$branch" \
+            --author ci-bot --message "test: eval-pr synthetic commit" \
+            --sha "$sha" --changed-files README \
+            | tee seed_output.json
+
+      - name: Poll for review.completed / a persisted report
+        env:
+          PGPASSWORD: swarm_dev_password
+        run: |
+          for i in $(seq 1 30); do
+            count=$(docker compose -f docker-compose.dev.yml exec -T postgres \
+              psql -U swarm -d code_review_swarm -tAc \
+              "SELECT count(*) FROM reports WHERE repo = 'octocat/Hello-World';")
+            echo "reports so far: $count (attempt $i/30)"
+            if [ "${count:-0}" -ge "1" ]; then
+              echo "Report persisted — pipeline completed end to end."
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "::error::No report.completed was persisted within the timeout"
+          exit 1
+
+      - name: Smoke test — metrics endpoints respond
+        run: |
+          set -e
+          curl -sf http://localhost:8001/metrics >/dev/null && echo "watcher /metrics OK"
+          curl -sf http://localhost:9102/metrics >/dev/null && echo "researcher /metrics OK"
+          curl -sf http://localhost:9103/metrics >/dev/null && echo "reviewer /metrics OK"
+
+      - name: Smoke test — no messages landed in the DLQ
+        run: |
+          depth=$(curl -sf -u swarm:swarm_dev_password \
+            http://localhost:15672/api/queues/%2F/q.dlq | jq '.messages // 0')
+          echo "q.dlq depth: $depth"
+          test "$depth" = "0"
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.dev.yml logs --tail=200
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose.dev.yml down -v
