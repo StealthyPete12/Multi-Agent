@@ -1,8 +1,246 @@
-# Multi-Agent
+# Code Review Swarm
 
-Event-Driven Multi-Agent Code Review Swarm.
+**An event-driven multi-agent system that watches GitHub commits, clones
+and statically analyzes the affected repository, computes a deterministic
+risk score, has an LLM explain (never set) that score, and posts the
+result to Slack — with a fault-tolerant, fully observable pipeline behind
+it.**
 
-This repo implements:
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](pyproject.toml)
+[![Tests: 234 passing](https://img.shields.io/badge/tests-234%20passing-brightgreen)](tests/)
+[![Code style: ruff + black](https://img.shields.io/badge/code%20style-ruff%20%2B%20black-black)](pyproject.toml)
+
+## Project overview
+
+Push a commit to a watched branch and, within seconds, three cooperating
+agents — connected only by RabbitMQ events, never by a direct call — turn
+it into an actionable Slack message: *what changed, how far the blast
+radius reaches through the codebase's import graph, whether it touches
+anything security-sensitive, a deterministic risk score, and a plain-
+English narrative explaining why*. No agent trusts another's uptime: every
+hop survives a crash, a redelivery, a transient failure, or an LLM outage
+without producing a duplicate or a lost report, and every hop is traced,
+metriced, and logged.
+
+## Why it exists
+
+Most "AI code review" demos are a single LLM call wrapping a diff. This
+project is a demonstration of the *engineering* around that call — the
+part that actually determines whether an AI-assisted pipeline survives
+contact with a real, always-on, at-least-once-delivery production
+environment: message durability, idempotent processing, a real retry/DLQ
+ladder, circuit breaking, distributed tracing, and a risk score that's
+deterministic and auditable specifically *because* an LLM should explain
+a decision, not make one it can't be held accountable for. It was built
+in six incremental phases (`PHASE_0_REPORT.md` through
+`PHASE_5_REPORT.md`), each one adding a real architectural layer without
+touching what the last phase had already proven, plus this Phase 6 pass
+(`PHASE_6_REPORT.md`) that turns it into a repository a new engineer can
+clone and run in minutes.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    GH[GitHub push] -->|"HTTPS POST /webhook/github\n(HMAC-signed)"| Watcher
+    Watcher["Watcher\n(FastAPI)"] -->|commit.detected| MQ1[(RabbitMQ)]
+    MQ1 --> Researcher["Researcher\n(clone, AST graph,\nblast radius, LLM summary)"]
+    Researcher -->|findings.ready| MQ2[(RabbitMQ)]
+    MQ2 --> Reviewer["Reviewer\n(risk score, LLM narrative,\nPostgres, Slack)"]
+    Reviewer -->|review.completed| MQ3[(RabbitMQ)]
+    Reviewer -->|Block Kit message| Slack[Slack]
+
+    classDef svc fill:#2563eb,color:#fff,stroke:none;
+    class Watcher,Researcher,Reviewer svc;
+```
+
+Full diagram set (data flow, retry/DLQ flow, observability stack,
+persistence layout) in [`docs/architecture.md`](docs/architecture.md).
+
+## Features
+
+- **GitHub webhook ingestion** with HMAC-SHA256 signature verification and
+  branch filtering (`agents/watcher`).
+- **AST-based Python import graph** built from a real shallow git clone,
+  persisted to Postgres, with **blast-radius impact analysis** via a
+  recursive CTE (`agents/researcher`).
+- **Sensitive-path detection** (auth/payments/infra/migrations,
+  configurable) that escalates risk independent of blast radius size.
+- **Deterministic, auditable risk scoring** — five weighted inputs, pure
+  code, zero LLM involvement in the actual score (`agents/reviewer/scoring.py`).
+- **LLM narrative generation** that explains an already-final score and
+  is explicitly instructed never to restate a different one, with a
+  template-based fallback so a report is never missing an explanation
+  (`shared/llm.py`, provider-agnostic: Anthropic/OpenAI/Ollama).
+- **Slack Block Kit notifications**, severity-colored, with a one-click
+  link to the commit.
+- **Full fault tolerance**: TTL/DLX retry ladder, claim-based idempotency
+  surviving a hard crash mid-message, Redis-backed rate limiting, a
+  circuit breaker per LLM provider, graceful shutdown, and a DLQ
+  inspect/replay CLI — see [Reliability features](#reliability-features).
+- **Full observability**: OpenTelemetry distributed tracing across every
+  RabbitMQ hop, a 24-instrument Prometheus metrics catalog, and 3
+  auto-provisioned Grafana dashboards — see [Observability features](#observability-features).
+- **Containerized and CI-validated**: multi-stage non-root Dockerfiles,
+  dev/prod Docker Compose stacks, and GitHub Actions that build every
+  image and run a real synthetic-commit pipeline end to end.
+
+## Tech stack
+
+| Layer | Technology |
+|---|---|
+| Language | Python 3.11+ |
+| Web / webhook receiver | FastAPI, Uvicorn |
+| Message broker | RabbitMQ (topic exchange, TTL+DLX retry ladder) |
+| Database | PostgreSQL 16 (asyncpg), recursive CTEs |
+| Cache / rate limiting | Redis (Lua-script token bucket) |
+| Contracts | Pydantic v2 (strict, versioned, closed) |
+| LLM | Anthropic / OpenAI / Ollama — direct HTTP, no vendor SDK |
+| Tracing | OpenTelemetry -> Arize Phoenix |
+| Metrics | OpenTelemetry -> Prometheus -> Grafana |
+| Containers | Docker (multi-stage, non-root), Docker Compose (dev/prod) |
+| CI | GitHub Actions (lint, real-service integration tests, Docker build, synthetic-pipeline smoke test) |
+| Code quality | ruff, black, mypy, pre-commit |
+| Testing | pytest, pytest-asyncio, pytest-httpx — 234 tests |
+
+## Example workflow
+
+```bash
+docker compose -f docker-compose.dev.yml up -d --build
+python -m tools.seed_commit --random
+```
+
+1. A `commit.detected` event is published (or arrives via a real signed
+   GitHub webhook — see [`docs/runbooks/deploy.md`](docs/runbooks/deploy.md)).
+2. The researcher clones the repo, builds the import graph, computes
+   blast radius, checks sensitive paths, and asks a small LLM for a
+   2-3 sentence semantic summary — publishing `findings.ready`.
+3. The reviewer computes a deterministic risk score, asks an LLM to
+   explain it, persists a report, and posts to Slack — publishing
+   `review.completed`.
+
+See [`docs/demo/`](docs/demo/) for the exact, schema-validated JSON at
+every stage of one real run, and
+[`docs/runbooks/operations.md`](docs/runbooks/operations.md) for every
+other way to generate and observe events.
+
+## Screenshots
+
+![RabbitMQ queue topology](docs/screenshots/rabbitmq_queues.png)
+![Grafana System Overview dashboard](docs/screenshots/grafana_system_overview.png)
+![A real end-to-end distributed trace in Phoenix](docs/screenshots/phoenix_trace_waterfall.png)
+
+More in [`docs/screenshots/`](docs/screenshots/) and
+[`docs/performance.md`](docs/performance.md).
+
+## Performance numbers
+
+100-commit load test (`tools/load_test.py`), single researcher + single
+reviewer instance:
+
+| Metric | Value |
+|---|---|
+| Throughput | 7.85 commits/sec |
+| p50 latency (publish -> report persisted) | 4.39s |
+| p95 latency | 11.29s |
+| p99 latency | 12.25s |
+| Completion rate | 100/100, zero DLQ messages |
+
+Full methodology, environment details, and known bottlenecks in
+[`docs/performance.md`](docs/performance.md). Both agents scale
+horizontally behind the same queue (`docker compose -f
+docker-compose.prod.yml up -d --scale researcher=3 --scale reviewer=3`) —
+safe by construction, since every consumer claims work idempotently
+before processing.
+
+## Reliability features
+
+- **TTL + dead-letter-exchange retry ladder** (5s -> 30s -> 5m -> DLQ), a
+  hand-built RabbitMQ pattern since no delayed-retry plugin is assumed.
+- **Three-way error classification** (`RetryableError` / `PoisonMessageError`
+  / `FatalError`) so a poison message never wastes a retry and a fatal one
+  never gets silently swallowed.
+- **Claim-before-processing idempotency** — a hard crash mid-message
+  (SIGKILL, OOM) is safely reclaimable, never a permanent skip or a
+  duplicate side effect.
+- **Redis-backed distributed rate limiting** and a **per-provider circuit
+  breaker** in front of every LLM call, both degrading gracefully rather
+  than becoming new single points of failure.
+- **Manual ack, `prefetch=1`, graceful shutdown** — every outcome is an
+  explicit, logged routing decision; SIGTERM drains in-flight work before
+  exiting.
+- **A DLQ inspect/dry-run/replay CLI** (`tools/replay_dlq.py`) — nothing
+  is ever silently dropped.
+- **Validated with real chaos scenarios**, not just unit tests —
+  `tests/test_chaos.py` runs 6 scenarios (crash-mid-processing, persistent
+  failure, malformed contract, duplicate delivery, circuit-breaker full
+  cycle) against a live broker and database.
+
+## Observability features
+
+- **Distributed tracing** across every RabbitMQ hop via OpenTelemetry, W3C
+  `traceparent` propagation, exported to Arize Phoenix — one trace_id
+  spans all three services.
+- **24 custom Prometheus instruments** (throughput, retry/DLQ counts,
+  circuit-breaker state, LLM calls/cost/latency, repository/blast-radius/
+  Postgres timings) plus RabbitMQ's and Postgres's own exporters.
+- **3 auto-provisioned Grafana dashboards** (System Overview, LLM,
+  Repository) — no manual import step.
+- **Structured JSON logs** carrying both the business `trace_id` and the
+  OTel `trace_id`/`span_id`, so a log line and a Phoenix trace are always
+  cross-referenceable in either direction.
+- **LLM cost estimation** per call, recorded as both a span attribute and
+  a Prometheus counter.
+
+Full catalog and diagrams in [`docs/architecture.md`](docs/architecture.md#observability-stack).
+
+## How to run
+
+```bash
+git clone <repo-url> && cd Multi-Agent
+cp .env.example .env
+docker compose -f docker-compose.dev.yml up -d --build   # or docker-compose.yml — see below
+python -m tools.seed_commit --random
+```
+
+Three ways to run this repo, depending on what you want:
+
+| | Use when |
+|---|---|
+| `docker-compose.yml` | Infra only; agents run as host processes. What this repo was developed and load-tested against. |
+| `docker-compose.dev.yml` | Everything containerized, standard bridge networking — the "clone and go" path. |
+| `docker-compose.prod.yml` | Same containers, resource limits, required (no default) secrets, configurable persistence. |
+
+Full instructions, GitHub webhook setup, and troubleshooting in
+[`docs/runbooks/deploy.md`](docs/runbooks/deploy.md),
+[`docs/runbooks/operations.md`](docs/runbooks/operations.md), and
+[`docs/runbooks/recovery.md`](docs/runbooks/recovery.md). Running the test
+suite:
+
+```bash
+pip install -e '.[dev]'
+pre-commit install
+pytest tests/
+```
+
+## Future improvements
+
+- Multi-instance load testing past a single researcher/reviewer replica.
+- Real LLM provider validation under sustained load (every run in this
+  repo's history, including this one, used `LLM_PROVIDER=none` — no
+  credentials/network egress available in the development sandbox).
+- A Redis-backed circuit breaker (cluster-wide, not per-process).
+- A real Postgres migration runner.
+
+Full list in [`ROADMAP.md`](ROADMAP.md).
+
+---
+
+## Development history
+
+This repo was built in six phases, each adding one architectural layer
+without redesigning what came before:
 
 - **Phase 0: foundational infrastructure** — the message broker,
   database, shared contracts, and shared logging that every agent builds
@@ -41,8 +279,20 @@ This repo implements:
   researcher, and reviewer pipelines are exactly as Phase 4 left them,
   with spans/metrics recording alongside the existing structured logs.
   See [`PHASE_5_REPORT.md`](PHASE_5_REPORT.md).
+- **Phase 6: production readiness & portfolio polish** — Dockerfiles,
+  dev/prod Compose stacks, GitHub Actions CI, code quality tooling
+  (ruff/black/mypy/pre-commit), `docs/architecture.md`, runbooks, demo
+  assets, this README, and release-prep files (`LICENSE`,
+  `CONTRIBUTING.md`, `SECURITY.md`, `ROADMAP.md`, `CHANGELOG.md`). No
+  business logic changed. See [`PHASE_6_REPORT.md`](PHASE_6_REPORT.md).
 
-## Architecture
+## Implementation deep-dive
+
+The rest of this document is a detailed technical reference — internal
+architecture, contract shapes, and every subsystem's design rationale —
+useful when you're modifying the code, not just running it.
+
+### Detailed pipeline reference
 
 ```
 GitHub push
@@ -412,16 +662,22 @@ agent already uses for Postgres/RabbitMQ/Redis — works reliably).
 
 ```
 .
-├── docker-compose.yml       # RabbitMQ, Postgres, Redis, Phoenix, Prometheus, Grafana, postgres-exporter
+├── docker-compose.yml       # infra only (RabbitMQ/Postgres/Redis/Phoenix/Prometheus/Grafana/postgres-exporter), agents on host
+├── docker-compose.dev.yml   # everything containerized, standard bridge networking
+├── docker-compose.prod.yml  # same containers, resource limits, required secrets, configurable persistence
 ├── .env.example             # every environment variable, documented
+├── .github/workflows/       # tests.yml, docker.yml, eval-pr.yml (CI)
+├── .pre-commit-config.yaml  # ruff, black, mypy, hygiene hooks
 ├── observability/
 │   ├── rabbitmq/enabled_plugins        # enables rabbitmq_prometheus
-│   ├── prometheus/prometheus.yml       # scrape config (all 6 targets)
-│   └── grafana/provisioning/
-│       ├── datasources/datasources.yml # Prometheus datasource
-│       └── dashboards/
-│           ├── dashboards.yml          # file-provider pointing at json/
-│           └── json/                   # System Overview, LLM, Repository dashboards
+│   ├── prometheus/{prometheus,prometheus.dev}.yml  # scrape config (host-network vs. bridge-network variants)
+│   └── grafana/
+│       ├── datasources.dev.yml         # Prometheus datasource (bridge-network compose files)
+│       └── provisioning/
+│           ├── datasources/datasources.yml # Prometheus datasource (host-network docker-compose.yml)
+│           └── dashboards/
+│               ├── dashboards.yml          # file-provider pointing at json/
+│               └── json/                   # System Overview, LLM, Repository dashboards
 ├── shared/
 │   ├── contracts.py         # Envelope + CommitDetected/FindingsReady/ReviewCompleted (Pydantic v2)
 │   ├── logging.py           # structured JSON logging, trace/correlation IDs, otel_trace_id/otel_span_id
@@ -439,6 +695,7 @@ agent already uses for Postgres/RabbitMQ/Redis — works reliably).
 │   └── README.md
 ├── agents/
 │   ├── watcher/              # GitHub webhook -> commit.detected (FastAPI), mounts /metrics
+│   │   └── Dockerfile        # multi-stage, non-root (~331MB runtime image)
 │   ├── researcher/           # commit.detected -> repo clone, AST graph, blast radius -> findings.ready
 │   │   ├── repository.py     # local git clone/cache (clone/refresh spans + metrics)
 │   │   ├── graph.py          # AST import analysis -> DependencyGraph
@@ -446,28 +703,33 @@ agent already uses for Postgres/RabbitMQ/Redis — works reliably).
 │   │   ├── db.py             # Postgres upserts + recursive-CTE blast radius (spans + metrics)
 │   │   ├── sensitive.py      # sensitive-path detection
 │   │   ├── diff.py            # best-effort truncated `git show` diff
-│   │   └── summarize.py       # LLM semantic-summary generation
+│   │   ├── summarize.py       # LLM semantic-summary generation
+│   │   └── Dockerfile         # multi-stage, non-root, includes git (~450MB runtime image)
 │   ├── reviewer/              # findings.ready -> risk score + narrative -> review.completed
 │   │   ├── scoring.py          # deterministic risk scoring (no LLM)
 │   │   ├── prompts.py          # narrative prompt + deterministic fallback
-│   │   └── storage.py          # Postgres persistence + idempotency (spans + metrics)
+│   │   ├── storage.py          # Postgres persistence + idempotency (spans + metrics)
+│   │   └── Dockerfile          # multi-stage, non-root (~331MB runtime image)
 │   └── orchestrator/          # placeholder — future topology/retry ownership
 ├── tools/
 │   ├── seed_commit.py        # publish synthetic commit.detected events, no GitHub needed
 │   ├── seed_findings.py      # publish synthetic findings.ready events, no researcher needed
 │   ├── replay_dlq.py         # inspect/filter/replay q.dlq messages
-│   └── load_test.py          # Phase 5 performance test — N synthetic commits, latency/throughput
+│   ├── load_test.py          # Phase 5 performance test — N synthetic commits, latency/throughput
+│   └── generate_demo_assets.py  # regenerates docs/demo/*.json from the real contract models
 ├── scripts/
 │   └── validate_stack.sh    # brings the stack up and checks it end-to-end
 ├── tests/
 │   ├── test_chaos.py         # repeatable chaos scenarios A-F
 │   └── test_telemetry.py     # span/propagation/metrics/OTel-setup tests
-├── PHASE_0_REPORT.md
-├── PHASE_1_REPORT.md
-├── PHASE_2_REPORT.md
-├── PHASE_3_REPORT.md
-├── PHASE_4_REPORT.md
-└── PHASE_5_REPORT.md
+├── docs/
+│   ├── architecture.md       # 5 Mermaid diagrams: overview, data flow, retry/DLQ, observability, storage
+│   ├── performance.md        # load-test methodology, results, known bottlenecks
+│   ├── demo/                 # sample_{commit,findings,review,slack_message}.json
+│   ├── screenshots/          # real captures of RabbitMQ/Grafana/Phoenix
+│   └── runbooks/             # deploy.md, recovery.md, operations.md
+├── PHASE_0_REPORT.md .. PHASE_6_REPORT.md
+├── LICENSE, CONTRIBUTING.md, SECURITY.md, ROADMAP.md, CHANGELOG.md
 ```
 
 ## Prerequisites
@@ -476,6 +738,11 @@ agent already uses for Postgres/RabbitMQ/Redis — works reliably).
 - Python 3.11+ (for `shared/` and running tests)
 
 ## Setup
+
+This walks through the infra-only path (`docker-compose.yml`, agents on
+the host) that this repo was developed and load-tested against. For the
+fully containerized dev/prod alternatives, see
+[`docs/runbooks/deploy.md`](docs/runbooks/deploy.md).
 
 1. Copy the environment template and adjust if needed (defaults work for
    local development):
@@ -501,10 +768,12 @@ agent already uses for Postgres/RabbitMQ/Redis — works reliably).
    ./scripts/validate_stack.sh
    ```
 
-4. Install the shared package and dev dependencies, then run tests:
+4. Install the shared package and dev dependencies, set up pre-commit,
+   and run tests:
 
    ```bash
    pip install -e '.[dev]'
+   pre-commit install
    pytest tests/
    ```
 
