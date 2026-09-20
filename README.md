@@ -1,43 +1,41 @@
 # Code Review Swarm
 
-**An event-driven multi-agent system that watches GitHub commits, clones
-and statically analyzes the affected repository, computes a deterministic
-risk score, has an LLM explain (never set) that score, and posts the
-result to Slack — with a fault-tolerant, fully observable pipeline behind
-it.**
+**A distributed, event-driven multi-agent system that watches GitHub commits,
+statically analyzes the affected codebase, computes a deterministic
+blast-radius and risk score, has an LLM narrate (never decide) that score,
+and reports the result — with a fault-tolerant, fully observable pipeline
+underneath every step.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](pyproject.toml)
 [![Tests: 234 passing](https://img.shields.io/badge/tests-234%20passing-brightgreen)](tests/)
 [![Code style: ruff + black](https://img.shields.io/badge/code%20style-ruff%20%2B%20black-black)](pyproject.toml)
 
-## Project overview
+---
 
-Push a commit to a watched branch and, within seconds, three cooperating
-agents — connected only by RabbitMQ events, never by a direct call — turn
-it into an actionable Slack message: *what changed, how far the blast
-radius reaches through the codebase's import graph, whether it touches
-anything security-sensitive, a deterministic risk score, and a plain-
-English narrative explaining why*. No agent trusts another's uptime: every
-hop survives a crash, a redelivery, a transient failure, or an LLM outage
+## Overview
+
+Most "AI code review" projects are a single LLM call wrapped around a diff.
+This one is a case study in the *engineering* that has to exist around that
+call before it can survive contact with a real, always-on, at-least-once
+production environment.
+
+Push a commit and three cooperating agents — connected only by RabbitMQ
+events, never by a direct function call — turn it into a structured risk
+report: what changed, how far the blast radius reaches through the
+codebase's real import graph, whether it touches anything
+security-sensitive, a deterministic risk score, and a plain-English
+narrative explaining why. No agent trusts another's uptime — every hop
+survives a crash, a redelivery, a transient failure, or an LLM outage
 without producing a duplicate or a lost report, and every hop is traced,
-metriced, and logged.
+metriced, and logged end to end.
 
-## Why it exists
-
-Most "AI code review" demos are a single LLM call wrapping a diff. This
-project is a demonstration of the *engineering* around that call — the
-part that actually determines whether an AI-assisted pipeline survives
-contact with a real, always-on, at-least-once-delivery production
-environment: message durability, idempotent processing, a real retry/DLQ
-ladder, circuit breaking, distributed tracing, and a risk score that's
-deterministic and auditable specifically *because* an LLM should explain
-a decision, not make one it can't be held accountable for. It was built
-in six incremental phases (`PHASE_0_REPORT.md` through
-`PHASE_5_REPORT.md`), each one adding a real architectural layer without
-touching what the last phase had already proven, plus this Phase 6 pass
-(`PHASE_6_REPORT.md`) that turns it into a repository a new engineer can
-clone and run in minutes.
+The system was built in six incremental phases, each adding one real
+architectural layer — message durability, repository analysis, an LLM
+layer, fault tolerance, full observability, then production polish —
+without touching what the previous phase had already proven. The phase
+reports (`PHASE_0_REPORT.md` – `PHASE_6_REPORT.md`) are the build log; this
+document is the finished result.
 
 ## Architecture
 
@@ -45,7 +43,7 @@ clone and run in minutes.
 flowchart LR
     GH[GitHub push] -->|"HTTPS POST /webhook/github\n(HMAC-signed)"| Watcher
     Watcher["Watcher\n(FastAPI)"] -->|commit.detected| MQ1[(RabbitMQ)]
-    MQ1 --> Researcher["Researcher\n(clone, AST graph,\nblast radius, LLM summary)"]
+    MQ1 --> Researcher["Researcher\n(dependency graph,\nblast radius, LLM summary)"]
     Researcher -->|findings.ready| MQ2[(RabbitMQ)]
     MQ2 --> Reviewer["Reviewer\n(risk score, LLM narrative,\nPostgres, Slack)"]
     Reviewer -->|review.completed| MQ3[(RabbitMQ)]
@@ -55,940 +53,459 @@ flowchart LR
     class Watcher,Researcher,Reviewer svc;
 ```
 
-Full diagram set (data flow, retry/DLQ flow, observability stack,
-persistence layout) in [`docs/architecture.md`](docs/architecture.md).
+The full topology — including Redis-backed rate limiting and the
+OpenTelemetry → Phoenix / Prometheus → Grafana observability stack wired
+into every service — is diagrammed below and in
+[`docs/architecture.md`](docs/architecture.md):
 
-## Features
+![System architecture: GitHub through Watcher, RabbitMQ, Researcher, Dependency Graph, Blast Radius Engine, Findings Queue, Reviewer, Postgres, Slack, with Redis/Phoenix/Prometheus/Grafana attached](docs/images/architecture.png)
 
-- **GitHub webhook ingestion** with HMAC-SHA256 signature verification and
-  branch filtering (`agents/watcher`).
-- **AST-based Python import graph** built from a real shallow git clone,
-  persisted to Postgres, with **blast-radius impact analysis** via a
-  recursive CTE (`agents/researcher`).
-- **Sensitive-path detection** (auth/payments/infra/migrations,
-  configurable) that escalates risk independent of blast radius size.
-- **Deterministic, auditable risk scoring** — five weighted inputs, pure
-  code, zero LLM involvement in the actual score (`agents/reviewer/scoring.py`).
-- **LLM narrative generation** that explains an already-final score and
-  is explicitly instructed never to restate a different one, with a
-  template-based fallback so a report is never missing an explanation
-  (`shared/llm.py`, provider-agnostic: Anthropic/OpenAI/Ollama).
-- **Slack Block Kit notifications**, severity-colored, with a one-click
-  link to the commit.
-- **Full fault tolerance**: TTL/DLX retry ladder, claim-based idempotency
-  surviving a hard crash mid-message, Redis-backed rate limiting, a
-  circuit breaker per LLM provider, graceful shutdown, and a DLQ
-  inspect/replay CLI — see [Reliability features](#reliability-features).
-- **Full observability**: OpenTelemetry distributed tracing across every
-  RabbitMQ hop, a 24-instrument Prometheus metrics catalog, and 3
-  auto-provisioned Grafana dashboards — see [Observability features](#observability-features).
-- **Containerized and CI-validated**: multi-stage non-root Dockerfiles,
-  dev/prod Docker Compose stacks, and GitHub Actions that build every
-  image and run a real synthetic-commit pipeline end to end.
+## How It Works
 
-## Tech stack
+Each of the three agents does exactly one job and hands off over a durable
+queue, never a direct call:
 
-| Layer | Technology |
-|---|---|
-| Language | Python 3.11+ |
-| Web / webhook receiver | FastAPI, Uvicorn |
-| Message broker | RabbitMQ (topic exchange, TTL+DLX retry ladder) |
-| Database | PostgreSQL 16 (asyncpg), recursive CTEs |
-| Cache / rate limiting | Redis (Lua-script token bucket) |
-| Contracts | Pydantic v2 (strict, versioned, closed) |
-| LLM | Anthropic / OpenAI / Ollama — direct HTTP, no vendor SDK |
-| Tracing | OpenTelemetry -> Arize Phoenix |
-| Metrics | OpenTelemetry -> Prometheus -> Grafana |
-| Containers | Docker (multi-stage, non-root), Docker Compose (dev/prod) |
-| CI | GitHub Actions (lint, real-service integration tests, Docker build, synthetic-pipeline smoke test) |
-| Code quality | ruff, black, mypy, pre-commit |
-| Testing | pytest, pytest-asyncio, pytest-httpx — 234 tests |
-
-## Example workflow
-
-```bash
-docker compose -f docker-compose.dev.yml up -d --build
-python -m tools.seed_commit --random
-```
-
-1. A `commit.detected` event is published (or arrives via a real signed
-   GitHub webhook — see [`docs/runbooks/deploy.md`](docs/runbooks/deploy.md)).
-2. The researcher clones the repo, builds the import graph, computes
-   blast radius, checks sensitive paths, and asks a small LLM for a
-   2-3 sentence semantic summary — publishing `findings.ready`.
-3. The reviewer computes a deterministic risk score, asks an LLM to
-   explain it, persists a report, and posts to Slack — publishing
+1. **Watcher** (`agents/watcher`) — a FastAPI service that verifies a
+   GitHub webhook's `X-Hub-Signature-256` HMAC, filters to watched
+   branches, extracts per-commit metadata, and publishes one
+   `commit.detected` event per commit.
+2. **Researcher** (`agents/researcher`) — clones the repository, walks
+   every `*.py` file with the stdlib `ast` module to build a real import
+   dependency graph, persists it to Postgres, runs a recursive-CTE
+   **blast-radius** query from the changed files outward, flags any
+   **sensitive-path** hits, asks a small LLM for a semantic summary
+   (empty string on failure — never blocks the pipeline), and publishes
+   `findings.ready`.
+3. **Reviewer** (`agents/reviewer`) — computes a **deterministic risk
+   score** from those findings (pure code, zero model involvement), asks
+   an LLM only to *narrate* that already-final score, persists the report
+   to Postgres, posts a Slack Block Kit message, and publishes
    `review.completed`.
 
-See [`docs/demo/`](docs/demo/) for the exact, schema-validated JSON at
-every stage of one real run, and
-[`docs/runbooks/operations.md`](docs/runbooks/operations.md) for every
-other way to generate and observe events.
+Every event is a versioned, strictly-typed `Envelope[Payload]`
+(`shared/contracts.py`) carrying one `trace_id` that threads through every
+log line and OpenTelemetry span from the moment GitHub delivers the
+webhook to the moment Slack receives the message — so one commit's entire
+journey through the swarm can be grepped or traced by a single ID.
 
-## Screenshots
+## Example: End-to-End Analysis
 
-![RabbitMQ queue topology](docs/screenshots/rabbitmq_queues.png)
-![Grafana System Overview dashboard](docs/screenshots/grafana_system_overview.png)
-![A real end-to-end distributed trace in Phoenix](docs/screenshots/phoenix_trace_waterfall.png)
+The walkthrough below is a real, schema-accurate simulation — generated
+locally from this repository's actual contracts and scoring logic, no
+network calls or credentials involved — of a commit landing on a
+payments-platform repository.
 
-More in [`docs/screenshots/`](docs/screenshots/) and
-[`docs/performance.md`](docs/performance.md).
+**Repository:** `acme/payment-platform`
+**Commit:** `Refactor payment authorization flow`
+**Modified files:** `payments/authorization.py`, `payments/gateway.py`,
+`auth/session.py`
 
-## Performance numbers
+### 1 — `commit.detected`
 
-100-commit load test (`tools/load_test.py`), single researcher + single
-reviewer instance:
+The watcher verifies the webhook signature and publishes:
 
-| Metric | Value |
+```json
+{
+  "event_id": "a1c9e2b7-0f6a-45c1-9ec2-a80acf44f814",
+  "event_type": "commit.detected",
+  "trace_id": "f3d8e120-6b71-4a3f-a3fe-e68eafe880b3",
+  "source": "watcher",
+  "occurred_at": "2026-09-20T09:14:02Z",
+  "payload": {
+    "repo": "acme/payment-platform",
+    "commit_sha": "7e2c1f9a3d6b58e0c1e9d6b4a7c3f8e1d2a5b6c9",
+    "branch": "main",
+    "author": "sam@acme.dev",
+    "message": "Refactor payment authorization flow",
+    "changed_files": [
+      "payments/authorization.py",
+      "payments/gateway.py",
+      "auth/session.py"
+    ]
+  }
+}
+```
+
+### 2 — Repository analysis & dependency graph discovery
+
+The researcher clones the commit, walks the checkout with `ast`, and adds
+three nodes/edges to the persisted import graph for
+`payments.authorization`, `payments.gateway`, and `auth.session` — the
+same graph every prior commit to this repo has already built up in
+Postgres (`agents/researcher/graph.py`, `agents/researcher/db.py`).
+
+### 3 — Blast-radius calculation
+
+A breadth-first traversal of the graph's reverse edges
+(`agents/researcher/impact.py`, backed by a recursive CTE in Postgres)
+walks outward from the three changed modules:
+
+![Blast radius graph for the simulated commit: three changed modules (payments.authorization, payments.gateway, auth.session) fanning out to five depth-1 dependents (checkout.flow, checkout.cart, payments.refunds, auth.login, billing.invoices) and one depth-2 dependent (order.confirmation)](docs/images/blast-radius-example.png)
+
+| | |
 |---|---|
-| Throughput | 7.85 commits/sec |
-| p50 latency (publish -> report persisted) | 4.39s |
-| p95 latency | 11.29s |
-| p99 latency | 12.25s |
-| Completion rate | 100/100, zero DLQ messages |
+| Impacted modules | 9 (`checkout.flow`, `checkout.cart`, `payments.refunds`, `auth.login`, `billing.invoices`, `order.confirmation`, plus the 3 changed) |
+| Max depth reached | 2 |
 
-Full methodology, environment details, and known bottlenecks in
-[`docs/performance.md`](docs/performance.md). Both agents scale
-horizontally behind the same queue (`docker compose -f
-docker-compose.prod.yml up -d --scale researcher=3 --scale reviewer=3`) —
-safe by construction, since every consumer claims work idempotently
-before processing.
+### 4 — Sensitive-path detection
 
-## Reliability features
+`agents/researcher/sensitive.py` matches every changed file against the
+configured sensitive-path patterns (`auth/`, `payments/`, `infra/`,
+`migrations/` by default) — independent of blast-radius size, so a
+one-line change to `auth/session.py` can't slip through just because it
+touches nothing else:
 
-- **TTL + dead-letter-exchange retry ladder** (5s -> 30s -> 5m -> DLQ), a
-  hand-built RabbitMQ pattern since no delayed-retry plugin is assumed.
-- **Three-way error classification** (`RetryableError` / `PoisonMessageError`
-  / `FatalError`) so a poison message never wastes a retry and a fatal one
-  never gets silently swallowed.
-- **Claim-before-processing idempotency** — a hard crash mid-message
-  (SIGKILL, OOM) is safely reclaimable, never a permanent skip or a
-  duplicate side effect.
-- **Redis-backed distributed rate limiting** and a **per-provider circuit
-  breaker** in front of every LLM call, both degrading gracefully rather
-  than becoming new single points of failure.
-- **Manual ack, `prefetch=1`, graceful shutdown** — every outcome is an
-  explicit, logged routing decision; SIGTERM drains in-flight work before
-  exiting.
-- **A DLQ inspect/dry-run/replay CLI** (`tools/replay_dlq.py`) — nothing
-  is ever silently dropped.
-- **Validated with real chaos scenarios**, not just unit tests —
-  `tests/test_chaos.py` runs 6 scenarios (crash-mid-processing, persistent
-  failure, malformed contract, duplicate delivery, circuit-breaker full
-  cycle) against a live broker and database.
-
-## Observability features
-
-- **Distributed tracing** across every RabbitMQ hop via OpenTelemetry, W3C
-  `traceparent` propagation, exported to Arize Phoenix — one trace_id
-  spans all three services.
-- **24 custom Prometheus instruments** (throughput, retry/DLQ counts,
-  circuit-breaker state, LLM calls/cost/latency, repository/blast-radius/
-  Postgres timings) plus RabbitMQ's and Postgres's own exporters.
-- **3 auto-provisioned Grafana dashboards** (System Overview, LLM,
-  Repository) — no manual import step.
-- **Structured JSON logs** carrying both the business `trace_id` and the
-  OTel `trace_id`/`span_id`, so a log line and a Phoenix trace are always
-  cross-referenceable in either direction.
-- **LLM cost estimation** per call, recorded as both a span attribute and
-  a Prometheus counter.
-
-Full catalog and diagrams in [`docs/architecture.md`](docs/architecture.md#observability-stack).
-
-## How to run
-
-```bash
-git clone <repo-url> && cd Multi-Agent
-cp .env.example .env
-docker compose -f docker-compose.dev.yml up -d --build   # or docker-compose.yml — see below
-python -m tools.seed_commit --random
-```
-
-Three ways to run this repo, depending on what you want:
-
-| | Use when |
+| Changed file | Pattern matched |
 |---|---|
-| `docker-compose.yml` | Infra only; agents run as host processes. What this repo was developed and load-tested against. |
-| `docker-compose.dev.yml` | Everything containerized, standard bridge networking — the "clone and go" path. |
-| `docker-compose.prod.yml` | Same containers, resource limits, required (no default) secrets, configurable persistence. |
+| `payments/authorization.py` | `payments/` |
+| `payments/gateway.py` | `payments/` |
+| `auth/session.py` | `auth/` |
 
-Full instructions, GitHub webhook setup, and troubleshooting in
-[`docs/runbooks/deploy.md`](docs/runbooks/deploy.md),
-[`docs/runbooks/operations.md`](docs/runbooks/operations.md), and
-[`docs/runbooks/recovery.md`](docs/runbooks/recovery.md). Running the test
-suite:
+All three changed files hit the sensitive-path policy — a signal the risk
+scorer weights independently of how far the change actually propagates.
 
-```bash
-pip install -e '.[dev]'
-pre-commit install
-pytest tests/
-```
+### 5 — Semantic summary (locally generated example)
 
-## Future improvements
+The researcher's summary step (`agents/researcher/summarize.py`) asks a
+small/cheap model for a 2–3 sentence summary of the diff. This example
+illustrates the shape of that output without calling any provider:
 
-- Multi-instance load testing past a single researcher/reviewer replica.
-- Real LLM provider validation under sustained load (every run in this
-  repo's history, including this one, used `LLM_PROVIDER=none` — no
-  credentials/network egress available in the development sandbox).
-- A Redis-backed circuit breaker (cluster-wide, not per-process).
-- A real Postgres migration runner.
+> *"Refactors the payment authorization flow, moving session validation
+> ahead of gateway dispatch in `payments/authorization.py` and updating
+> `auth/session.py`'s expiry check accordingly. `payments/gateway.py` is
+> updated to accept the pre-validated session object rather than
+> re-deriving it, removing a redundant lookup on the hot path."*
 
-Full list in [`ROADMAP.md`](ROADMAP.md).
+`findings.ready` is published with this summary, the blast radius, and
+the sensitive hits attached.
 
----
+### 6 — Risk scoring
 
-## Development history
+`agents/reviewer/scoring.py::compute_score` is pure code — five weighted,
+bucketed inputs, no model in the loop:
 
-This repo was built in six phases, each adding one architectural layer
-without redesigning what came before:
-
-- **Phase 0: foundational infrastructure** — the message broker,
-  database, shared contracts, and shared logging that every agent builds
-  on. See [`PHASE_0_REPORT.md`](PHASE_0_REPORT.md).
-- **Phase 1: walking skeleton** — proves an event can move from webhook
-  → RabbitMQ → consumer with durability and acknowledgements. No AI, no
-  Postgres business logic, no blast-radius analysis yet. See
-  [`PHASE_1_REPORT.md`](PHASE_1_REPORT.md).
-- **Phase 2: repository-analysis engine** — the researcher agent now
-  clones repositories, builds a Python import dependency graph via AST
-  analysis, persists it to Postgres, computes blast radius with a
-  recursive CTE, flags sensitive-path changes, and publishes
-  `findings.ready`. No AI, no Slack, no reviewer logic yet. See
-  [`PHASE_2_REPORT.md`](PHASE_2_REPORT.md).
-- **Phase 3: intelligence layer** — a provider-agnostic LLM abstraction
-  (`shared/llm.py`), a semantic-summary step added to the researcher, and
-  a new reviewer agent that deterministically scores each commit's risk,
-  asks an LLM only to *explain* that score, persists a report, and
-  notifies Slack. See [`PHASE_3_REPORT.md`](PHASE_3_REPORT.md).
-- **Phase 4: fault tolerance** — a RabbitMQ delayed-retry ladder
-  (`shared/retry.py`), error classification (`shared/errors.py`),
-  claim-before-processing idempotency (`shared/idempotency.py`), a
-  Redis-backed rate limiter (`shared/ratelimit.py`) and circuit breaker
-  (`shared/breaker.py`) wired into every LLM call, manual-ack consumer
-  hygiene with graceful shutdown, and a DLQ inspection/replay tool
-  (`tools/replay_dlq.py`). No business logic changed — watcher, repo
-  cache, AST graph, blast radius, reviewer scoring, and Slack formatting
-  are exactly as Phase 3 left them. See
-  [`PHASE_4_REPORT.md`](PHASE_4_REPORT.md).
-- **Phase 5: observability** — distributed tracing end-to-end across
-  every RabbitMQ hop (`shared/telemetry.py`, OpenTelemetry, exported to
-  [Arize Phoenix](https://arize.com/docs/phoenix)), a Prometheus metrics
-  catalog (throughput, retries, DLQ, LLM cost/latency, repository/blast
-  radius/Postgres timings) scraped from each service's `/metrics`, and
-  Grafana dashboards over all of it. No business logic changed — watcher,
-  researcher, and reviewer pipelines are exactly as Phase 4 left them,
-  with spans/metrics recording alongside the existing structured logs.
-  See [`PHASE_5_REPORT.md`](PHASE_5_REPORT.md).
-- **Phase 6: production readiness & portfolio polish** — Dockerfiles,
-  dev/prod Compose stacks, GitHub Actions CI, code quality tooling
-  (ruff/black/mypy/pre-commit), `docs/architecture.md`, runbooks, demo
-  assets, this README, and release-prep files (`LICENSE`,
-  `CONTRIBUTING.md`, `SECURITY.md`, `ROADMAP.md`, `CHANGELOG.md`). No
-  business logic changed. See [`PHASE_6_REPORT.md`](PHASE_6_REPORT.md).
-
-## Implementation deep-dive
-
-The rest of this document is a detailed technical reference — internal
-architecture, contract shapes, and every subsystem's design rationale —
-useful when you're modifying the code, not just running it.
-
-### Detailed pipeline reference
-
-```
-GitHub push
-    │  HTTPS POST /webhook/github (HMAC-signed)
-    ▼
-agents/watcher  ──────────────► RabbitMQ (swarm.events exchange)
-(FastAPI)          commit.detected         │
-                    routing key             │  q.commits (durable, prefetch=1,
-                                             │  manual ack; dead-letters to
-                                             │  q.commits.dlq on a raw nack)
-                                             ▼
-                                agents/researcher (consumer)
-                                claim event_id (shared/idempotency.py) ->
-                                clone repo -> AST import graph -> Postgres
-                                (modules/imports) -> blast radius (recursive
-                                CTE) -> sensitive-path check -> semantic
-                                summary (small/cheap LLM, shared/llm.py,
-                                rate-limited + circuit-broken) -> mark
-                                complete
-                                             │
-                             on failure: classify (shared/errors.py) ->
-                             RetryableError -> retry ladder (5s/30s/5m) ->
-                             PoisonMessageError -> q.dlq immediately ->
-                             FatalError -> log + stop the service
-                                             │
-                                             │  findings.ready (success path)
-                                             ▼
-                                          q.findings (durable, prefetch=1)
-                                             │
-                                             ▼
-                                agents/reviewer (consumer)
-                                claim event_id -> deterministic risk score
-                                (scoring.py, unchanged) -> LLM narrative
-                                (explains the score, never sets it) ->
-                                Postgres (reports) -> Slack -> mark complete
-                                             │
-                             same retry/DLQ/fatal routing as the researcher
-                                             │
-                                             │  review.completed
-                                             ▼
-                                          q.reviews (durable, prefetch=1)
-
-Retry ladder (shared/retry.py), shared by every consumer:
-
-  attempt 1 fails ──► q.retry.5s  ──(TTL expiry)──► back to origin queue
-  attempt 2 fails ──► q.retry.30s ──(TTL expiry)──► back to origin queue
-  attempt 3 fails ──► q.retry.5m  ──(TTL expiry)──► back to origin queue
-  attempt 4 fails ──► q.dlq (terminal — inspect/replay with tools/replay_dlq.py)
-```
-
-`tools/seed_commit.py` can publish synthetic `commit.detected` events
-directly, bypassing the watcher/GitHub entirely, and `tools/seed_findings.py`
-does the same for `findings.ready` directly against the reviewer — both
-useful for local testing without a real repo or webhook. See
-[`agents/researcher/README.md`](agents/researcher/README.md) and
-[`agents/reviewer/README.md`](agents/reviewer/README.md) for each agent's
-internal architecture.
-
-Every event is an `Envelope[Payload]` (see [`shared/contracts.py`](shared/contracts.py))
-carrying a `trace_id` that's generated once per webhook delivery (or
-`seed_commit`/`seed_findings` invocation) and threaded through every log
-line via [`shared/logging.py`](shared/logging.py)'s `trace_context`, so a
-single commit's path through the entire watcher → researcher → reviewer
-pipeline can be grepped out of JSON logs by `trace_id`.
-
-`agents/orchestrator` remains a placeholder — see its README for what
-it'll own in a later phase.
-
-### LLM integration
-
-`shared/llm.py` defines one `LLMClient` protocol and three
-implementations (`AnthropicClient`, `OpenAIClient`, `OllamaClient`), each
-a thin direct-HTTP wrapper (no vendor SDK) so provider identity never
-leaks past this module. `LLM_PROVIDER` selects the provider entirely via
-environment variables (see `.env.example`); an unset/`none` value, or a
-configured provider missing its credential, returns a `NullLLMClient`
-that raises `LLMError` on every call — every caller already has to handle
-"the LLM is unavailable" as a normal case, so a missing provider and a
-live outage take the same code path.
-
-Two call sites, two purposes (`get_llm_client(purpose=...)`, tunable via
-`MODEL_SELECTIONS`):
-
-- **Researcher → `summary`**: `agents/researcher/summarize.py` asks a
-  small/cheap model for a 2-3 sentence, ≤300-token semantic summary of a
-  commit (message + changed files + a truncated `git show` diff). Falls
-  back to `""` on failure — matches the empty-string placeholder Phase 2
-  already put on the wire.
-- **Reviewer → `narrative`**: `agents/reviewer/prompts.py` +
-  `agents/reviewer/main.py::generate_narrative` ask a model to explain an
-  *already-computed* score/severity in ≤500 tokens — why it's what it is,
-  what may be affected, where to focus review. The model is given the
-  score as fact and instructed never to restate a different one. Falls
-  back to a deterministic template (`build_fallback_narrative`) on
-  failure, so a report is never missing an explanation.
-
-### Error classification (`shared/errors.py`)
-
-Every failure a consumer or `shared/llm.py` can hit is classified into
-exactly one of three types, each with a distinct routing outcome:
-
-| Type | Examples | Routing |
+| Input | Value | Points |
 |---|---|---|
-| `RetryableError` | HTTP 429/5xx, connection/timeout errors, a transient `git clone`/`fetch` failure | Retry ladder (or `q.dlq` once attempts are exhausted) |
-| `PoisonMessageError` | Contract/schema validation failure, an unknown `schema_version`, a commit SHA that genuinely doesn't exist in the repo, a malformed LLM response | `q.dlq` immediately, zero retry attempts |
-| `FatalError` | Anything unclassified/unexpected | Logged critical, message nacked with `requeue=True` (not lost), service stops (`SystemExit(1)`) rather than grinding through the rest of the queue the same broken way |
+| Blast radius (max depth = 2) | ≤ 3 | 0 |
+| Impacted modules (9) | ≤ 10 | 0 |
+| Sensitive-path hits (3 files) | multiple | +4 |
+| Changed files (3) | ≤ 5 | 0 |
+| Test proximity | no test file in changed set or blast radius | +2 |
+| **Total** | | **6 → severity: `high`** |
 
-`shared/errors.py::classify_exception` handles the provider-agnostic
-cases (HTTP status codes, `httpx` network exceptions) that `shared/llm.py`
-uses directly. Each agent's `main.py` has its own
-`classify_researcher_failure`/`classify_reviewer_failure` on top of that
-for exception types specific to that agent (`CommitNotFoundError`,
-`GitCommandError`, `SlackError`) — kept out of `shared/errors.py`
-deliberately, since `shared/` must never depend on `agents/`.
+Three sensitive-path hits and zero test coverage push this commit to
+**high** severity — `status_for_severity("high")` maps to
+`needs_review` — even though the blast radius itself is modest. This is
+the scorer working as designed: blast radius alone would have called this
+commit low-risk; the sensitive-path signal is what escalates it.
 
-### Retry ladder (`shared/retry.py`)
+### 7 — Reviewer narrative
 
-RabbitMQ has no native "retry in N seconds" without the (non-default)
-delayed-message-exchange plugin, so this implements the standard
-TTL+dead-letter-exchange "parking lot" pattern by hand: `q.retry.5s` →
-`q.retry.30s` → `q.retry.5m`, each a durable queue with a fixed
-`x-message-ttl` whose `x-dead-letter-exchange` points back at the main
-`swarm.events` exchange. When a message's TTL expires, RabbitMQ
-redelivers it automatically — no relay process needed.
+The reviewer asks an LLM to *explain* the already-final score — never to
+restate a different one — with a deterministic template as a fallback
+whenever no provider is configured:
 
-The one subtlety this depends on (verified empirically against a live
-broker before building on it): a TTL-expired message is redelivered
-using the routing key it was *originally published with when it entered
-the expiring queue*, not the queue's own name, as long as the queue
-doesn't set `x-dead-letter-routing-key` itself. Each rung therefore gets
-its own small dedicated topic exchange (bound catch-all, `#`, to exactly
-one queue) purely as a named "entry door" for that delay tier — scheduling
-a retry means picking the rung's exchange and publishing with the
-message's real business routing key (`commit.detected`/`findings.ready`),
-and the main exchange's own topic bindings route it back to the correct
-origin queue for free.
+> *"This commit touches `payments/authorization.py`, `payments/gateway.py`,
+> and `auth/session.py` — all three matched by the sensitive-path policy
+> for authentication and payments code, which is why the score carries the
+> maximum sensitive-hit weight despite a contained blast radius (9 impacted
+> modules, max depth 2: `payments.authorization` → `checkout.flow`,
+> `payments.gateway` → `checkout.cart` → `order.confirmation`,
+> `auth.session` → `auth.login` / `billing.invoices`). No test file was
+> touched in this commit, so the session-validation reordering ahead of
+> gateway dispatch should be verified manually before merge, with
+> particular attention to the payments path receiving a validated session
+> before charge submission."*
 
-Retry metadata (`x-retry-attempt`, `x-retry-reason`,
-`x-retry-original-queue`, `x-retry-first-failed-at`) travels as AMQP
-message headers, not inside the envelope body — the strict/closed
-contracts from Phase 0-3 stay untouched. `MAX_RETRY_ATTEMPTS` (3, one per
-rung) is derived from the ladder's own length; a 4th failure routes to
-the terminal `q.dlq` instead of another rung.
+### 8 — `review.completed`
 
-### DLQ flow and replay
-
-`q.dlq` is one shared, terminal queue for both routing paths: a poison
-message (`RetryLadder.send_raw_to_dlq`, preserving the *original* bytes —
-never reconstructed — since the message may not even be a valid envelope)
-and a retryable failure that exhausted the ladder
-(`RetryLadder.send_to_dlq`). Per-queue `<queue>.dlq` queues still exist
-(from Phase 1's broker topology) as RabbitMQ's own automatic fallback for
-anything nacked without an explicit Phase 4 routing decision.
-
-`tools/replay_dlq.py` inspects and replays it:
-
-```bash
-python -m tools.replay_dlq inspect                                   # list, changes nothing
-python -m tools.replay_dlq replay --original-queue q.commits --dry-run  # preview a replay
-python -m tools.replay_dlq replay --all                              # replay everything
-python -m tools.replay_dlq replay --event-id <id>                    # replay one message
+```json
+{
+  "event_type": "review.completed",
+  "trace_id": "f3d8e120-6b71-4a3f-a3fe-e68eafe880b3",
+  "payload": {
+    "repo": "acme/payment-platform",
+    "commit_sha": "7e2c1f9a3d6b58e0c1e9d6b4a7c3f8e1d2a5b6c9",
+    "status": "needs_review",
+    "severity": "high",
+    "score": 6,
+    "score_breakdown": {
+      "blast_radius_points": 0,
+      "impact_count_points": 0,
+      "sensitive_hits_points": 4,
+      "changed_files_points": 0,
+      "test_proximity_points": 2
+    }
+  }
+}
 ```
 
-AMQP has no server-side "peek", so inspecting means consuming — the tool
-always drains the queue into memory first, then decides per message:
-`inspect` and `--dry-run` requeue everything unchanged (nothing is ever
-lost or removed); a real replay acks (permanently removes) only the
-messages actually replayed and requeues the rest. A replayed message goes
-straight back to its original queue (default exchange, routing key = the
-queue name recorded in `x-retry-original-queue`) with a fresh attempt
-budget, since a human is presumably replaying only after fixing whatever
-caused the failure.
+The reviewer persists this report to Postgres, posts a severity-colored
+Slack Block Kit message, and publishes `review.completed` — closing the
+loop on the same `trace_id` the watcher generated when the webhook first
+arrived. A second, real recorded run of this exact pipeline — one
+`trace_id` spanning all three services end to end — is in
+[`docs/demo/`](docs/demo/); the event-flow diagram below shows what
+happens when a step in this chain fails instead of succeeding.
 
-### Idempotency (`shared/idempotency.py`)
+## Event Flow & Reliability Routing
 
-Reuses the `processed_events` table from Phase 0, extended by
-`db/migrations/003_idempotency_claims.sql` with `claimed_at`/
-`completed_at` so a claim and its completion are two distinct states:
+```mermaid
+flowchart LR
+    CD(["commit.detected"]) --> QC["q.commits"]
+    QC --> Researcher
 
-1. **Claim** — `INSERT ... ON CONFLICT (event_id) DO NOTHING` before any
-   work starts. Atomic, so two concurrent redeliveries of the same
-   `event_id` can never both proceed — one gets `claimed=True`, the other
-   bails out before doing anything observable (no duplicate Slack
-   message, no duplicate report).
-2. **Perform work** — the consumer's normal pipeline.
-3. **Mark complete** — `mark_complete()`, called once every side effect
-   (publish, persist, notify) has actually happened.
+    Researcher -->|success| FR(["findings.ready"])
+    Researcher -->|exception| C1{"classify_exception()"}
+    C1 -->|RetryableError| L1["Retry ladder\n5s -> 30s -> 5m"]
+    L1 -->|redelivered| QC
+    L1 -->|attempts exhausted| DLQ[("q.dlq")]
+    C1 -->|PoisonMessageError| DLQ
 
-A caught `RetryableError` calls `release()` (deletes the claim) so an
-immediate retry-ladder redelivery can reclaim it. A **hard crash**
-(SIGKILL, OOM-kill) never runs any exception handler at all — no
-`release()`, no `mark_complete()`. Without a way to tell "claimed and
-completed" apart from "claimed, then the process died mid-work", the
-message would survive at the broker (RabbitMQ redelivers an unacked
-message) but the pipeline would silently never produce its output,
-because every redelivery would see the claim as still active. `claim()`
-treats a claim that's neither completed nor reclaimed within
-`IDEMPOTENCY_STALE_CLAIM_SECONDS` (default 300s) as abandoned and lets a
-new caller reclaim it — a completed claim is never reclaimable regardless
-of age.
+    FR --> QF["q.findings"]
+    QF --> Reviewer
 
-### Rate limiting (`shared/ratelimit.py`)
+    Reviewer -->|success| RC(["review.completed"])
+    Reviewer -->|exception| C2{"classify_exception()"}
+    C2 -->|RetryableError| L2["Retry ladder\n5s -> 30s -> 5m"]
+    L2 -->|redelivered| QF
+    L2 -->|attempts exhausted| DLQ
+    C2 -->|PoisonMessageError| DLQ
 
-A distributed token bucket, Redis-backed so multiple instances of the
-same agent share one limit instead of each enforcing its own in-memory
-bucket, and scoped per `"<provider>:<model>"` (`RATE_LIMIT_TOKENS_PER_MINUTE`,
-overridable per provider via `RATE_LIMIT_<PROVIDER>_TPM`). Refills
-continuously (tokens/ms) rather than resetting at a fixed window
-boundary, so it can't allow a 2x burst right at a window edge. Atomicity
-comes from a Lua script run via Redis `EVAL` — the whole
-read-modify-write happens as one atomic operation, safe across
-concurrent callers in different processes. `shared/llm.py` calls
-`wait_and_acquire()` before every provider request; a Redis outage
-degrades gracefully (logs a warning, proceeds without limiting) rather
-than becoming a new single point of failure for the whole pipeline.
+    RC --> QR["q.reviews"]
+    DLQ -->|"tools/replay_dlq.py"| QC
+    DLQ -->|"tools/replay_dlq.py"| QF
 
-### Circuit breaker (`shared/breaker.py`)
+    classDef event fill:#16a34a,color:#fff,stroke:none;
+    classDef term fill:#dc2626,color:#fff,stroke:none;
+    class CD,FR,RC event;
+    class DLQ term;
+```
 
-One breaker per LLM provider (shared by every caller in the process),
-standard three-state machine:
+Static render: [`docs/images/event-flow.png`](docs/images/event-flow.png).
 
-- **CLOSED** — normal operation, consecutive failures counted.
-- **OPEN** — after `LLM_BREAKER_FAILURE_THRESHOLD` (default 5)
-  consecutive failures, every call fails fast with `CircuitOpenError`
-  (no network attempt at all) for `LLM_BREAKER_OPEN_SECONDS` (default 60).
-- **HALF_OPEN** — once the open window elapses, the next call is a trial:
-  success closes the breaker and increments `recovery_count`; failure
-  reopens it for another full window.
+## Dependency Graph Analysis
 
-Integrated into `shared/llm.py::_BaseLLMClient._execute_with_resilience`,
-so every provider (Anthropic/OpenAI/Ollama) gets it automatically. Metrics
-(`failure_count`/`open_count`/`recovery_count`) are logged on every state
-transition.
+`agents/researcher/graph.py` parses every `*.py` file in a checkout with
+the stdlib `ast` module — absolute imports, `from` imports, and relative
+imports, with best-effort resolution of package-level re-exports — and
+persists the result as `modules`/`imports` rows in Postgres, upserted
+idempotently per commit so re-analyzing an unchanged commit is a no-op.
+This graph is what every blast-radius query walks; it's rebuilt
+incrementally as new commits land, so the researcher never re-derives the
+whole codebase's dependency shape from scratch on a query.
 
-### LLM retry/backoff
+## Blast Radius Detection
 
-`shared/llm.py::_BaseLLMClient._execute_with_resilience` is the single
-choke point every provider's `complete()` routes through: acquire a rate
-limit token → run the request behind the circuit breaker → on a failure
-classified `RetryableError`, sleep an exponential-backoff-with-full-jitter
-delay (`min(base * 2**(attempt-1), max)`, then a random delay in
-`[0, that)`, to avoid synchronized retry storms across instances) and try
-again, up to `LLM_MAX_RETRIES` (default 3) times. A `PoisonMessageError`
-(malformed response) or an open circuit fails immediately with no
-retries spent on it. Every attempt logs `retry_count`/
-`retry_delay_seconds`/the classified reason.
+Given a set of changed files, `agents/researcher/impact.py` (in-memory,
+unit-testable) and `agents/researcher/db.py` (recursive CTE, the
+production path) both walk the graph's *reverse* edges — "who imports
+this?" — breadth-first from the changed modules, cycle-safe, bounded by a
+configurable max depth (`BLAST_RADIUS_MAX_DEPTH`, default 10). The result
+is exactly what fed the risk score above: `impact_count`, `max_depth`, and
+the full `impacted_modules` list, all computed with zero AI involvement —
+this is graph traversal, not inference, which is why the number is
+reproducible and auditable.
 
-### Consumer hygiene and graceful shutdown
+## Risk Scoring
 
-Both the researcher and reviewer consumers run with `prefetch_count=1`
-(at most one unacked message in flight, so manual ack/nack always applies
-to exactly the message being handled) and manual acknowledgement
-throughout — no more ack-on-success/nack-on-any-exception context
-manager; every outcome (success, retryable failure, poison, fatal) makes
-an explicit, logged routing decision. On SIGTERM/SIGINT, a consumer stops
-accepting new work and gives any in-flight message a bounded
-`GRACEFUL_SHUTDOWN_SECONDS` (default 30) window to finish naturally
-before a hard-cancel fallback; broker/database connections close only
-after. An AMQP heartbeat (`RABBITMQ_HEARTBEAT`, default 60s) lets both
-sides detect a dead connection well before a kernel-level timeout would.
-
-### Risk scoring methodology
-
-`agents/reviewer/scoring.py::compute_score` is pure code — no model call,
-no randomness. Five inputs, each bucketed to a small integer, summed into
-one score, then mapped to a severity by configurable thresholds:
+`agents/reviewer/scoring.py::compute_score` is deterministic by design:
+same `FindingsReady` payload in, same score out, always — no randomness,
+no external call, no model in the loop. Five inputs, each bucketed to a
+small integer:
 
 | Input | Signal | Buckets → points |
 |---|---|---|
 | Blast radius | `blast_radius.max_depth` | ≤3→0, ≤10→+2, else→+4 |
 | Impacted modules | `blast_radius.impact_count` | ≤10→0, ≤50→+2, else→+4 |
-| Sensitive path hits | `len(sensitive_hits)` | none→0, one→+2, multiple→+4 |
+| Sensitive-path hits | `len(sensitive_hits)` | none→0, one→+2, multiple→+4 |
 | Changed files | `len(changed_files)` | ≤5→0, ≤20→+1, else→+3 |
-| Test proximity | path-marker heuristic (no repo checkout available) | proximate→0, not→+2 |
+| Test proximity | path-marker heuristic | proximate→0, not→+2 |
 
-Severity: `< RISK_SCORE_MODERATE_THRESHOLD` → low, `< …HIGH…` → moderate,
-`< …CRITICAL…` → high, else → critical (all three thresholds configurable
-via `.env`; bucket boundaries above are the roadmap's own defaults).
-`agents/reviewer/scoring.py::status_for_severity` then maps severity to
-`ReviewCompleted.status` (`low`→passed, `moderate`/`high`→needs_review,
-`critical`→failed).
+The sum maps to a severity by configurable thresholds
+(`low` / `moderate` / `high` / `critical`), which in turn maps to a CI-gate-style
+status (`passed` / `needs_review` / `failed`). The LLM narrative step that
+follows is given this score as an immutable fact and explicitly instructed
+never to restate a different one — if the model and the scorer ever
+disagree, the scorer is correct by construction. The worked example above
+shows exactly why this separation matters: a small blast radius alone
+would have scored this commit low-risk, but the sensitive-path signal
+correctly overrode that and pushed it to `needs_review`.
 
-### Slack integration
+## Reliability Engineering
 
-`shared/slack.py::build_review_message` renders a Slack Block Kit message
-(repository, commit SHA, severity, score, blast radius, sensitive hits,
-narrative, a "View Commit" link) wrapped in a colored `attachments` bar
-keyed by severity. `SlackNotifier.send()` posts it to `SLACK_WEBHOOK_URL`
-via a plain HTTPS POST; an unconfigured webhook is a no-op (logged, not
-an error) so local dev/CI never needs a real Slack workspace.
+RabbitMQ's at-least-once delivery means every one of these had to be
+solved for real, not assumed away:
 
-### Observability (`shared/telemetry.py`)
+- **TTL + dead-letter-exchange retry ladder** (`shared/retry.py`) — a
+  hand-built `q.retry.5s → q.retry.30s → q.retry.5m → q.dlq` pattern,
+  since no delayed-retry plugin is assumed. A subtlety verified against a
+  live broker before relying on it: a TTL-expired message is redelivered
+  with the routing key it entered the rung with, so each rung's own small
+  topic exchange is just a named "entry door" — the main exchange's
+  bindings route it back to the correct origin queue for free.
+- **Three-way error classification** (`shared/errors.py`) —
+  `RetryableError` (HTTP 429/5xx, transient network/git failures) enters
+  the ladder; `PoisonMessageError` (schema violations, malformed LLM
+  responses) skips straight to the DLQ with zero wasted retries;
+  `FatalError` logs critical and stops the service rather than grinding
+  through the rest of the queue the same broken way.
+- **Claim-before-processing idempotency** (`shared/idempotency.py`) — an
+  atomic `INSERT ... ON CONFLICT DO NOTHING` claim taken before any work
+  starts, so two concurrent redeliveries of the same event can never both
+  proceed. A **hard crash mid-message** (SIGKILL, OOM) leaves a claim
+  that's neither completed nor released; after `IDEMPOTENCY_STALE_CLAIM_SECONDS`
+  it's treated as abandoned and safely reclaimed — never a permanent skip,
+  never a duplicate side effect.
+- **Redis-backed distributed rate limiting** (`shared/ratelimit.py`) — a
+  Lua-script token bucket shared across every instance of an agent, scoped
+  per provider/model, refilling continuously rather than resetting at a
+  window boundary.
+- **Per-provider circuit breaker** (`shared/breaker.py`) — standard
+  CLOSED/OPEN/HALF_OPEN state machine in front of every LLM call, failing
+  fast with no network attempt once a provider is unhealthy, rather than
+  letting it become a new single point of failure.
+- **Manual ack, `prefetch=1`, graceful shutdown** — every outcome is an
+  explicit, logged routing decision; SIGTERM drains in-flight work within
+  a bounded window before exiting.
+- **A DLQ inspect/dry-run/replay CLI** (`tools/replay_dlq.py`) — nothing
+  is ever silently dropped, and a replay gets a fresh attempt budget once
+  the root cause is fixed.
+- **Validated with real chaos scenarios**, not just unit tests —
+  `tests/test_chaos.py` runs crash-mid-processing, persistent-failure,
+  malformed-contract, duplicate-delivery, and circuit-breaker-full-cycle
+  scenarios against a live broker and database.
 
-One shared module initializes OpenTelemetry for every service:
-`init_telemetry(service_name)` installs a process-wide `TracerProvider`
-and `MeterProvider` exactly once (idempotent — safe to call again),
-entirely driven by environment variables (`OTEL_TRACES_EXPORTER` /
-`OTEL_METRICS_EXPORTER`: `otlp_http` | `otlp_grpc` | `console` | `none`,
-plus `prometheus` for metrics), and returns a tracer/meter scoped to that
-service. No agent branches on "is tracing configured" — an unconfigured
-exporter degrades to a real (harmless) no-op provider, the same pattern
-`shared/llm.py`'s `NullLLMClient` already established for a missing LLM
-provider.
+## Observability
 
-**Tracing.** `shared/broker.py::Broker.publish()` opens a PRODUCER span
-and injects its W3C `traceparent` into the AMQP message headers
-(alongside the existing business `trace_id` header from Phase 0);
-`telemetry.consumer_span()` — called at the top of every consumer's
-`handle_message()`, right next to the existing `trace_context(...)` —
-extracts that header and continues the *same* trace as a CONSUMER span's
-child. This is what makes one trace survive
-`watcher → RabbitMQ → researcher → RabbitMQ → reviewer → Slack` instead
-of restarting at every hop: verified live against a real Phoenix instance
-in this repo (see PHASE_5_REPORT.md's "Distributed trace validation" —
-one `trace_id` covering 13 spans across all three services, including the
-Slack delivery). Every stage the roadmap asked for is its own span:
-webhook processing, RabbitMQ publish/consume, repository
-clone/refresh, graph build, blast-radius analysis, database writes, LLM
-requests, review generation, and Slack delivery. `shared/logging.py`'s
-`JsonFormatter` also stamps every log line with `otel_trace_id`/
-`otel_span_id` (reading the *currently active* span, if any) alongside
-the pre-existing business `trace_id`/`correlation_id`, so a log line and
-a Phoenix trace can always be cross-referenced in either direction.
+Every service ships tracing, metrics, and structured logs from the same
+`shared/telemetry.py` module — none of it bolted on after the fact:
 
-**Metrics.** `shared/telemetry.py::Metrics` is a single catalog of every
-counter/histogram the roadmap asked for (event throughput, retry/DLQ
-counts, circuit-breaker opens, rate-limit delays, LLM
-calls/failures/tokens/cost/duration, Slack deliveries, repository
-clone/cache-hit/duration, blast-radius/review/database durations,
-Postgres pool/failures), created once off whatever meter the current
-process has (a real one after `init_telemetry()`, a no-op before it — the
-same test-safety pattern as tracing). Instruments are recorded at the
-exact point each event already happens in the code (e.g.
-`shared/retry.py::schedule_retry`, `shared/breaker.py`'s `OPEN`
-transition, `agents/researcher/db.py::blast_radius`) — no polling, no
-separate collector process. Exported as a Prometheus exposition endpoint
-by default: researcher/reviewer each open their own (`RESEARCHER_METRICS_PORT`/
-`REVIEWER_METRICS_PORT`, default 9102/9103); the watcher mounts
-`/metrics` on its existing FastAPI app instead of a second port
-(`prometheus_client.make_asgi_app()`).
+- **OpenTelemetry distributed tracing** across every RabbitMQ hop, with
+  W3C `traceparent` propagation injected on publish and continued on
+  consume, exported to **Arize Phoenix** — one `trace_id` spans
+  `watcher → RabbitMQ → researcher → RabbitMQ → reviewer → Slack` as a
+  single trace, verified live against a running Phoenix instance (13
+  spans across all three services in one trace).
+- **24 custom Prometheus instruments** — throughput, retry/DLQ counts,
+  circuit-breaker state transitions, LLM calls/cost/latency, repository
+  clone/graph/blast-radius/Postgres timings — plus RabbitMQ's and
+  Postgres's own exporters. Every metric name a Grafana panel queries is
+  statically cross-checked against the real registered instrument names
+  by `tests/test_observability_config.py`.
+- **3 auto-provisioned Grafana dashboards** (System Overview, LLM,
+  Repository) — no manual import step.
+- **Structured JSON logs** carrying both the business `trace_id` and the
+  OTel `trace_id`/`span_id`, so a log line and a Phoenix trace are always
+  cross-referenceable in either direction.
+- **Per-call LLM cost estimation**, recorded as both a span attribute and
+  a Prometheus counter.
 
-**LLM cost.** `shared/llm.py::_BaseLLMClient._execute_with_resilience`
-(the single choke point every provider's `complete()` already routes
-through — see "LLM retry/backoff" above) wraps its retry loop in one
-`llm.request` CLIENT span and records `llm_calls`/`llm_failures`/
-`retry_count`/breaker-state on it; `_log_usage()` (called once per
-successful response, already logging token counts) additionally calls
-`telemetry.record_llm_success()`, which estimates cost from
-`telemetry.PRICING_PER_1M_TOKENS_USD` (env-overridable per model,
-`LLM_PRICE_<MODEL>_IN_PER_1M`/`_OUT_PER_1M`) and records it as both a
-span attribute and the `swarm_llm_cost_usd_total` counter.
+![RabbitMQ queue topology](docs/screenshots/rabbitmq_queues.png)
+![Grafana System Overview dashboard](docs/screenshots/grafana_system_overview.png)
+![A real end-to-end distributed trace in Phoenix](docs/screenshots/phoenix_trace_waterfall.png)
 
-**Docker services.** `docker-compose.yml` adds Phoenix (OTLP receiver +
-UI, persisted to a named volume), Prometheus (scrapes every service's
-`/metrics`, config in `observability/prometheus/prometheus.yml`), Grafana
-(three dashboards auto-provisioned from
-`observability/grafana/provisioning/dashboards/json/`), and a Postgres
-exporter; RabbitMQ gets its `rabbitmq_prometheus` plugin enabled via a
-mounted `enabled_plugins` file. All four new/changed services use
-`network_mode: host` on Linux — see PHASE_5_REPORT.md's "Known
-limitations" for exactly why (short version: this sandbox's Docker
-daemon blocks fresh container-to-container bridge traffic, while
-host↔container via a published port — the same path every existing
-agent already uses for Postgres/RabbitMQ/Redis — works reliably).
+More in [`docs/screenshots/`](docs/screenshots/) and full diagrams (data
+flow, observability stack, persistence layout) in
+[`docs/architecture.md`](docs/architecture.md).
 
-## Repo structure
+## Performance
+
+100-commit load test (`tools/load_test.py`) against a real local git
+fixture, published through the actual `Broker`, polled to completion in
+Postgres — single researcher + single reviewer instance:
+
+| Metric | Value |
+|---|---|
+| Commits submitted / completed | 100 / 100 |
+| DLQ messages | 0 |
+| Throughput | 7.85 commits/sec |
+| Average latency | 5081.0 ms |
+| p50 latency (publish → report persisted) | 4385.6 ms |
+| p95 latency | 11286.7 ms |
+| p99 latency | 12248.3 ms |
+
+Zero DLQ messages and zero ERROR-level log lines across both agents for
+the run's duration. Latency grows with queue position by design —
+`prefetch_count=1` means the researcher processes strictly one commit at a
+time, an intentional consumer-hygiene choice (see
+[Reliability Engineering](#reliability-engineering)), not a bottleneck —
+and both agents are safe to scale horizontally behind the same queue,
+since every consumer claims work idempotently before processing it. Full
+methodology, environment details, and known bottlenecks in
+[`docs/performance.md`](docs/performance.md).
+
+## Technical Highlights
+
+Engineering decisions worth calling out on their own:
+
+- **The LLM never makes a decision it can be wrong about.** Risk scoring
+  is pure, deterministic code (`agents/reviewer/scoring.py`); the model is
+  given a final score and instructed only to explain it, with a
+  template-based fallback so a report is never missing a narrative. This
+  is the difference between "AI-assisted" and "AI-decided," and it's
+  enforced structurally, not by prompt convention.
+- **Provider-agnostic LLM layer with no vendor SDK.** `shared/llm.py`
+  defines one `LLMClient` protocol with direct-HTTP implementations for
+  Anthropic, OpenAI, and Ollama, all routed through a single resilience
+  choke point (`_execute_with_resilience`) that wires in rate limiting,
+  circuit breaking, and exponential-backoff-with-full-jitter retry
+  identically regardless of provider.
+- **A hand-built RabbitMQ delayed-retry ladder**, because the standard
+  broker has no native "retry in N seconds" primitive without a
+  non-default plugin — implemented as a TTL + dead-letter-exchange
+  pattern, with a routing-key-preservation subtlety verified empirically
+  against a live broker before the rest of the system was built on top of
+  it.
+- **A crash-safe idempotency model** that distinguishes "claimed and
+  completed" from "claimed, then the process died mid-work" — the
+  distinction that makes a hard SIGKILL mid-message safely reclaimable
+  instead of either a silent permanent skip or a duplicate Slack message.
+- **One trace_id, three services, zero blind spots.** Every RabbitMQ hop
+  continues the same OpenTelemetry trace via W3C header propagation rather
+  than starting a new one, so a single distributed trace covers the
+  webhook, both queue hops, and the Slack delivery.
+- **Contracts as the only coupling between agents.** Three services never
+  call each other directly — `shared/contracts.py`'s versioned, strict
+  Pydantic models are the entire interface, evolved additively so an older
+  consumer never breaks on a newer producer's payload.
+
+## Repository Map
 
 ```
-.
-├── docker-compose.yml       # infra only (RabbitMQ/Postgres/Redis/Phoenix/Prometheus/Grafana/postgres-exporter), agents on host
-├── docker-compose.dev.yml   # everything containerized, standard bridge networking
-├── docker-compose.prod.yml  # same containers, resource limits, required secrets, configurable persistence
-├── .env.example             # every environment variable, documented
-├── .github/workflows/       # tests.yml, docker.yml, eval-pr.yml (CI)
-├── .pre-commit-config.yaml  # ruff, black, mypy, hygiene hooks
-├── observability/
-│   ├── rabbitmq/enabled_plugins        # enables rabbitmq_prometheus
-│   ├── prometheus/{prometheus,prometheus.dev}.yml  # scrape config (host-network vs. bridge-network variants)
-│   └── grafana/
-│       ├── datasources.dev.yml         # Prometheus datasource (bridge-network compose files)
-│       └── provisioning/
-│           ├── datasources/datasources.yml # Prometheus datasource (host-network docker-compose.yml)
-│           └── dashboards/
-│               ├── dashboards.yml          # file-provider pointing at json/
-│               └── json/                   # System Overview, LLM, Repository dashboards
-├── shared/
-│   ├── contracts.py         # Envelope + CommitDetected/FindingsReady/ReviewCompleted (Pydantic v2)
-│   ├── logging.py           # structured JSON logging, trace/correlation IDs, otel_trace_id/otel_span_id
-│   ├── broker.py            # aio-pika topology, publish, consume — used by every agent
-│   ├── llm.py                # provider-agnostic LLMClient (Anthropic/OpenAI/Ollama), retry/breaker/rate-limit wired in
-│   ├── slack.py              # Block Kit message + incoming-webhook delivery
-│   ├── errors.py             # RetryableError/PoisonMessageError/FatalError classification
-│   ├── retry.py              # RabbitMQ delayed-retry ladder (q.retry.5s/30s/5m -> q.dlq)
-│   ├── idempotency.py        # claim-before-processing against processed_events
-│   ├── ratelimit.py          # Redis-backed distributed token bucket
-│   ├── breaker.py            # CLOSED/OPEN/HALF_OPEN circuit breaker
-│   └── telemetry.py          # OpenTelemetry tracing/metrics init, propagation, cost estimation
-├── db/
-│   ├── migrations/          # schema, applied on first Postgres boot
-│   └── README.md
-├── agents/
-│   ├── watcher/              # GitHub webhook -> commit.detected (FastAPI), mounts /metrics
-│   │   └── Dockerfile        # multi-stage, non-root (~331MB runtime image)
-│   ├── researcher/           # commit.detected -> repo clone, AST graph, blast radius -> findings.ready
-│   │   ├── repository.py     # local git clone/cache (clone/refresh spans + metrics)
-│   │   ├── graph.py          # AST import analysis -> DependencyGraph
-│   │   ├── impact.py         # in-memory blast-radius traversal
-│   │   ├── db.py             # Postgres upserts + recursive-CTE blast radius (spans + metrics)
-│   │   ├── sensitive.py      # sensitive-path detection
-│   │   ├── diff.py            # best-effort truncated `git show` diff
-│   │   ├── summarize.py       # LLM semantic-summary generation
-│   │   └── Dockerfile         # multi-stage, non-root, includes git (~450MB runtime image)
-│   ├── reviewer/              # findings.ready -> risk score + narrative -> review.completed
-│   │   ├── scoring.py          # deterministic risk scoring (no LLM)
-│   │   ├── prompts.py          # narrative prompt + deterministic fallback
-│   │   ├── storage.py          # Postgres persistence + idempotency (spans + metrics)
-│   │   └── Dockerfile          # multi-stage, non-root (~331MB runtime image)
-│   └── orchestrator/          # placeholder — future topology/retry ownership
-├── tools/
-│   ├── seed_commit.py        # publish synthetic commit.detected events, no GitHub needed
-│   ├── seed_findings.py      # publish synthetic findings.ready events, no researcher needed
-│   ├── replay_dlq.py         # inspect/filter/replay q.dlq messages
-│   ├── load_test.py          # Phase 5 performance test — N synthetic commits, latency/throughput
-│   └── generate_demo_assets.py  # regenerates docs/demo/*.json from the real contract models
-├── scripts/
-│   └── validate_stack.sh    # brings the stack up and checks it end-to-end
-├── tests/
-│   ├── test_chaos.py         # repeatable chaos scenarios A-F
-│   └── test_telemetry.py     # span/propagation/metrics/OTel-setup tests
-├── docs/
-│   ├── architecture.md       # 5 Mermaid diagrams: overview, data flow, retry/DLQ, observability, storage
-│   ├── performance.md        # load-test methodology, results, known bottlenecks
-│   ├── demo/                 # sample_{commit,findings,review,slack_message}.json
-│   ├── screenshots/          # real captures of RabbitMQ/Grafana/Phoenix
-│   └── runbooks/             # deploy.md, recovery.md, operations.md
-├── PHASE_0_REPORT.md .. PHASE_6_REPORT.md
-├── LICENSE, CONTRIBUTING.md, SECURITY.md, ROADMAP.md, CHANGELOG.md
+agents/watcher/      GitHub webhook -> commit.detected (FastAPI)
+agents/researcher/   commit.detected -> dependency graph, blast radius, sensitive-path check -> findings.ready
+agents/reviewer/     findings.ready -> deterministic risk score, LLM narrative, Postgres, Slack -> review.completed
+shared/              contracts, broker, retry ladder, idempotency, rate limiting, circuit breaker, telemetry, LLM client
+docs/architecture.md Full diagram set: data flow, retry/DLQ flow, observability stack, persistence layout
+docs/performance.md  Load-test methodology, results, known bottlenecks
+docs/demo/           One real, schema-validated event chain, start to finish
+docs/runbooks/       Deploy, operations, and recovery procedures
+PHASE_0..6_REPORT.md The six-phase build log this system was developed against
 ```
 
-## Prerequisites
+## Development History
 
-- Docker + Docker Compose v2
-- Python 3.11+ (for `shared/` and running tests)
+Built in six phases, each adding one architectural layer without
+redesigning what came before — full detail in each phase's report:
 
-## Setup
+| Phase | What it added |
+|---|---|
+| [0](PHASE_0_REPORT.md) | Message broker topology, database schema, shared contracts, structured logging |
+| [1](PHASE_1_REPORT.md) | Walking skeleton — webhook → RabbitMQ → consumer, durable and acknowledged |
+| [2](PHASE_2_REPORT.md) | AST dependency graph, recursive-CTE blast radius, sensitive-path detection |
+| [3](PHASE_3_REPORT.md) | Provider-agnostic LLM layer, semantic summaries, deterministic risk scoring, Slack |
+| [4](PHASE_4_REPORT.md) | Retry ladder, error classification, idempotency, rate limiting, circuit breaker |
+| [5](PHASE_5_REPORT.md) | End-to-end distributed tracing, Prometheus metrics catalog, Grafana dashboards |
+| [6](PHASE_6_REPORT.md) | Containerization, CI, runbooks, and this showcase pass |
 
-This walks through the infra-only path (`docker-compose.yml`, agents on
-the host) that this repo was developed and load-tested against. For the
-fully containerized dev/prod alternatives, see
-[`docs/runbooks/deploy.md`](docs/runbooks/deploy.md).
+---
 
-1. Copy the environment template and adjust if needed (defaults work for
-   local development):
-
-   ```bash
-   cp .env.example .env
-   ```
-
-2. Start the infrastructure:
-
-   ```bash
-   docker compose up -d
-   ```
-
-   This starts RabbitMQ (broker + management UI), PostgreSQL (with the
-   schema in [`db/migrations`](db/migrations) applied automatically on
-   first boot), and Redis. All three have healthchecks; `docker compose
-   ps` shows `healthy` once ready.
-
-3. Verify everything end-to-end (healthchecks, management UI, schema):
-
-   ```bash
-   ./scripts/validate_stack.sh
-   ```
-
-4. Install the shared package and dev dependencies, set up pre-commit,
-   and run tests:
-
-   ```bash
-   pip install -e '.[dev]'
-   pre-commit install
-   pytest tests/
-   ```
-
-## Using the stack
-
-- **RabbitMQ management UI:** http://localhost:15672
-  (user/password from `.env`, default `swarm` / `swarm_dev_password`)
-- **Postgres:** `postgresql://swarm:swarm_dev_password@localhost:5432/code_review_swarm`
-  (or read `DATABASE_URL` from `.env`)
-- **Redis:** `redis://:swarm_dev_password@localhost:6379/0`
-  (or read `REDIS_URL` from `.env`)
-- **Phoenix (traces):** http://localhost:6006 — every service's spans,
-  with LLM-call detail (prompt/response, token usage) once a real
-  provider is configured.
-- **Prometheus:** http://localhost:9090 — raw metrics + the
-  [Targets](http://localhost:9090/targets) page to check scrape health.
-- **Grafana:** http://localhost:3000 (`admin`/`admin` by default, see
-  `GRAFANA_ADMIN_USER`/`GRAFANA_ADMIN_PASSWORD`) — three dashboards
-  auto-provisioned under the "Code Review Swarm" folder: System Overview,
-  LLM, and Repository.
-- **watcher/researcher/reviewer `/metrics`:** http://localhost:8001/metrics,
-  http://localhost:9102/metrics, http://localhost:9103/metrics — what
-  Prometheus scrapes; useful to check directly while developing a new
-  metric.
-
-Phoenix/Prometheus/Grafana run with `network_mode: host` (Linux), so they
-reach the RabbitMQ/Postgres containers and the host-process
-watcher/researcher/reviewer the same way everything else in this stack
-already does — via `localhost:<port>`, not container DNS. See
-PHASE_5_REPORT.md if you're deploying this on Docker Desktop (Mac/Windows)
-or a non-Linux host, where host networking behaves differently.
-
-## Shared contracts
-
-`shared/contracts.py` defines the versioned, strictly-typed messages that
-flow through RabbitMQ:
-
-```python
-from shared.contracts import CommitDetected, EventType, make_envelope
-
-payload = CommitDetected(
-    repo="acme/widgets",
-    commit_sha="...",
-    branch="main",
-    author="jane@acme.dev",
-    message="fix: off by one",
-    committed_at=...,
-)
-envelope = make_envelope(payload, event_type=EventType.COMMIT_DETECTED, source="ingestion")
-body = envelope.to_bytes()  # publish this as the RabbitMQ message body
-```
-
-On the consumer side, decode with `Envelope[CommitDetected].from_json(body)`
-if the payload type is known, or `parse_envelope(body)` if a queue can
-carry more than one event type.
-
-## Shared logging
-
-```python
-from shared.logging import configure_logging, trace_context
-
-log = configure_logging(service_name="ingestion")
-
-with trace_context(trace_id=envelope.trace_id, correlation_id=envelope.event_id):
-    log.info("commit detected", extra={"commit_sha": payload.commit_sha})
-```
-
-Every log line is a single JSON object on stdout, suitable for container
-log collectors.
-
-## Local testing workflow (Path A — no GitHub needed)
-
-1. Bring up the stack (`docker compose up -d`) and copy `.env.example` to
-   `.env`.
-2. In one terminal, run the pipeline-verification consumer:
-
-   ```bash
-   python -m agents.researcher.main
-   ```
-
-3. In another terminal, publish a synthetic event:
-
-   ```bash
-   # explicit fields
-   python -m tools.seed_commit --repo acme/widgets --branch main \
-       --author jane --message "fix: off by one"
-
-   # or a random commit
-   python -m tools.seed_commit --random
-
-   # or a burst of random commits
-   python -m tools.seed_commit --random --count 5
-   ```
-
-4. The researcher's stdout logs a `commit.detected received` line with
-   the same `trace_id`/`event_id` the seed script printed, then acks the
-   message. Check http://localhost:15672 (RabbitMQ management UI) to see
-   `q.commits` and its `q.commits.dlq` dead-letter queue.
-
-### Testing the researcher's repository analysis (Phase 2)
-
-`CommitDetected.repo` (e.g. `acme/widgets`) is resolved to a clone URL as
-`${REPO_CLONE_BASE_URL}/${repo}.git` by default. To test against a real
-GitHub repo, leave `REPO_CLONE_BASE_URL=https://github.com/` (the
-default) and seed a commit with a real `--repo`/`--sha`. To test entirely
-offline (no GitHub, no network), point it at a local git repository:
-
-```bash
-# 1. Create a local "remote" the researcher can clone from.
-mkdir -p /tmp/sample-remotes/acme/widgets.git
-cd /tmp/sample-remotes/acme/widgets.git
-git init -q -b main
-echo "def connect(): pass" > database.py
-mkdir auth && echo "import database" > auth/login.py && touch auth/__init__.py
-git add . && git commit -q -m "initial commit"
-git rev-parse HEAD   # <- use this as --sha below
-
-# 2. Point the researcher at it and run the pipeline as usual.
-export REPO_CLONE_BASE_URL="file:///tmp/sample-remotes/"
-python -m agents.researcher.main &
-python -m tools.seed_commit --repo acme/widgets --branch main --author jane \
-    --message "test change" --sha <sha-from-above> \
-    --changed-files database.py,auth/login.py
-```
-
-The researcher logs each stage (repository cache hit/miss, graph build,
-Postgres write, blast-radius query, semantic-summary generation) and
-publishes `findings.ready` to `q.findings` with the computed blast
-radius and any sensitive-path hits (`auth/login.py` above matches the
-default `auth/` pattern). Running the same commit again logs a cache hit
-instead of re-cloning, and re-storing the same graph leaves
-`modules`/`imports` row counts unchanged (idempotent upserts).
-
-### Testing the reviewer's scoring and narrative (Phase 3)
-
-Apply `db/migrations/002_reviewer_reports.sql` once if your Postgres
-volume predates Phase 3 (see [`db/README.md`](db/README.md)), then:
-
-```bash
-python -m agents.reviewer.main &
-
-# low-risk commit
-python -m tools.seed_findings --repo acme/widgets --sha low0001
-
-# sensitive path touched (escalates severity even with a small blast radius)
-python -m tools.seed_findings --repo acme/widgets --sha sens0001 \
-    --changed-files auth/login.py --sensitive-hits auth/login.py
-
-# large blast radius (high/critical severity)
-python -m tools.seed_findings --repo acme/widgets --sha big0001 \
-    --impact-count 60 --max-depth 9 \
-    --impacted-modules pkg.a,pkg.b,pkg.c
-```
-
-The reviewer logs risk-score computation, narrative generation (or the
-"skipped, using fallback" warning if no `LLM_PROVIDER` is configured),
-the Postgres write, Slack delivery (skipped and logged as such if
-`SLACK_WEBHOOK_URL` is unset), and `published review.completed`. Query
-the persisted report with:
-
-```bash
-docker compose exec postgres psql -U swarm -d code_review_swarm \
-    -c "SELECT repo, commit_sha, severity, score, status FROM reports ORDER BY generated_at DESC LIMIT 5;"
-```
-
-Re-running `seed_findings` with the same `event_id`/`--sha` combination
-(via `--trace-id` reuse isn't needed here — idempotency keys on the
-envelope's own `event_id`, generated fresh per invocation) demonstrates
-nothing to dedupe on a normal re-seed; the idempotency guard is exercised
-by `tests/test_reviewer_storage.py` and by RabbitMQ's own at-least-once
-redelivery of a single unacked message.
-
-## GitHub webhook setup (Path B)
-
-1. Start the watcher:
-
-   ```bash
-   uvicorn agents.watcher.main:app --host 0.0.0.0 --port ${WATCHER_PORT:-8001}
-   ```
-
-2. On the GitHub repo you want to watch: **Settings → Webhooks → Add
-   webhook**.
-   - Payload URL: your tunnel URL + `/webhook/github` (see Smee setup
-     below for local dev).
-   - Content type: `application/json`.
-   - Secret: the same value as `GITHUB_WEBHOOK_SECRET` in your `.env`.
-   - Events: "Just the push event".
-3. Push a commit to a branch listed in `WATCHED_BRANCHES` (default
-   `main`). The watcher verifies the `X-Hub-Signature-256` HMAC, extracts
-   commit metadata, and publishes one `commit.detected` event per commit
-   in the push.
-4. With `agents/researcher/main.py` running, watch it log the received
-   event.
-
-### Smee.io setup (tunneling GitHub → localhost)
-
-GitHub needs a public URL to deliver webhooks to; [Smee](https://smee.io)
-forwards deliveries to your local watcher without exposing your machine
-directly.
-
-```bash
-# get a channel URL at https://smee.io/new, then:
-npx smee-client --url https://smee.io/<your-channel> \
-    --target http://localhost:${WATCHER_PORT:-8001}/webhook/github
-```
-
-Use the `https://smee.io/<your-channel>` URL as the webhook's Payload URL
-in GitHub. Smee replays each delivery (including headers) to your local
-`/webhook/github` endpoint, so signature verification behaves exactly as
-it would against GitHub directly. `SMEE_URL` in `.env.example` is a place
-to note the channel for your own reference — no service reads it.
-
-## Tearing down
-
-```bash
-docker compose down        # stop containers, keep data
-docker compose down -v     # stop containers and delete named volumes
-```
+For running the stack yourself, see
+[`docs/runbooks/deploy.md`](docs/runbooks/deploy.md) (setup and GitHub
+webhook configuration), [`docs/runbooks/operations.md`](docs/runbooks/operations.md)
+(generating events, watching the pipeline), and
+[`docs/runbooks/recovery.md`](docs/runbooks/recovery.md) (DLQ replay,
+failure investigation). Contribution guidelines in
+[`CONTRIBUTING.md`](CONTRIBUTING.md), security policy in
+[`SECURITY.md`](SECURITY.md), and what's next in [`ROADMAP.md`](ROADMAP.md).
